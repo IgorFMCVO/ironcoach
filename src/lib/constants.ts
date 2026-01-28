@@ -229,6 +229,15 @@ export const COORDINATION_REQUEST_TYPES = [
     isUrgent: true,
   },
   { 
+    id: 'LONG_ATTENDANCE', 
+    label: 'Atendimento Longo', 
+    icon: '⏱️',
+    description: 'Atendimento excedeu 1 minuto',
+    color: '#F59E0B',
+    suggestedActions: ['Verificar se precisa de ajuda', 'Avaliar complexidade', 'Registrar motivo'],
+    isUrgent: true,
+  },
+  { 
     id: 'VERIFY_FREQUENCY', 
     label: 'Verificar Frequência', 
     icon: '📊',

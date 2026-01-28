@@ -52,6 +52,17 @@ import {
   reactivateMember,
   markAsPersonal,
   unmarkAsPersonal,
+  // Multi-Professor
+  startCoachSession,
+  pauseCoachSession,
+  endCoachSession,
+  getSuggestedMember,
+  coachStartAttending,
+  coachEndAttending,
+  getActiveCoaches,
+  notifyLongAttendance,
+  subscribeToCoachSessions,
+  type CoachSession,
   type QueueMember as DBQueueMember,
   type Priority,
   type InterventionType as DBInterventionType,
@@ -352,6 +363,13 @@ export default function Dashboard() {
   const [skipModal, setSkipModal] = useState<QueueMember | null>(null);
   const [isSkipping, setIsSkipping] = useState(false);
   
+  // FASE 2: Multi-Professor
+  const [activeCoaches, setActiveCoaches] = useState<CoachSession[]>([]);
+  const [suggestedMemberId, setSuggestedMemberId] = useState<string | null>(null);
+  const [longAttendanceNotified, setLongAttendanceNotified] = useState(false);
+  const [showPauseModal, setShowPauseModal] = useState(false);
+  const [showTimeExceededAlert, setShowTimeExceededAlert] = useState(false);
+  
   const { playSound, playAlert } = useAudio();
   const { vibrateSuccess } = useVibration();
   
@@ -542,14 +560,105 @@ export default function Dashboard() {
     return () => clearInterval(i);
   }, [queue, isMuted, coach, activeAttendance, playAlert]);
 
-  const handleLogin = (c: Coach) => {
+  // MULTI-PROFESSOR: Subscrever para atualizações de coaches ativos
+  useEffect(() => {
+    if (!coach) return;
+    
+    // Buscar coaches ativos inicialmente
+    getActiveCoaches().then(setActiveCoaches);
+    
+    // Subscrever para atualizações
+    const unsub = subscribeToCoachSessions((sessions) => {
+      setActiveCoaches(sessions);
+    });
+    
+    return () => unsub();
+  }, [coach]);
+
+  // MULTI-PROFESSOR: Buscar sugestão quando não está atendendo e há mais de 1 coach
+  useEffect(() => {
+    if (!coach || activeAttendance || activeCoaches.length <= 1) {
+      setSuggestedMemberId(null);
+      return;
+    }
+    
+    // Buscar sugestão do próximo aluno
+    const fetchSuggestion = async () => {
+      const result = await getSuggestedMember(coach.id);
+      if (result.suggested) {
+        setSuggestedMemberId(result.suggested.id);
+      } else {
+        setSuggestedMemberId(null);
+      }
+    };
+    
+    fetchSuggestion();
+    
+    // Atualizar sugestão a cada 10 segundos
+    const interval = setInterval(fetchSuggestion, 10000);
+    return () => clearInterval(interval);
+  }, [coach, activeAttendance, activeCoaches.length, queue]);
+
+  // MULTI-PROFESSOR: Verificar tempo de atendimento excedido (> 60s)
+  useEffect(() => {
+    if (!activeAttendance || !coach) return;
+    
+    const checkLongAttendance = () => {
+      const elapsed = Math.floor((Date.now() - activeAttendance.startTime) / 1000);
+      
+      // Se passou de 60 segundos e ainda não notificou
+      if (elapsed > 60 && !longAttendanceNotified) {
+        // Mostrar alerta visual
+        setShowTimeExceededAlert(true);
+        
+        // Tocar som e vibrar
+        if (!isMuted) {
+          playAlert();
+          vibrateSuccess(); // Usar vibração disponível
+        }
+        
+        // Notificar supervisor
+        notifyLongAttendance(
+          coach.id,
+          coach.name,
+          activeAttendance.member.id,
+          activeAttendance.member.name,
+          activeAttendance.member.priority,
+          elapsed
+        );
+        
+        setLongAttendanceNotified(true);
+        
+        console.log(`⏱️ Atendimento longo notificado: ${activeAttendance.member.name} - ${elapsed}s`);
+      }
+    };
+    
+    const interval = setInterval(checkLongAttendance, 1000);
+    return () => clearInterval(interval);
+  }, [activeAttendance, coach, longAttendanceNotified, isMuted, playAlert, vibrateSuccess]);
+
+  const handleLogin = async (c: Coach) => {
     setCoach(c);
     localStorage.setItem('iron_coach_session', JSON.stringify(c));
+    
+    // MULTI-PROFESSOR: Iniciar sessão do coach
+    await startCoachSession(c.id, c.name);
+    
+    // Buscar coaches ativos
+    const coaches = await getActiveCoaches();
+    setActiveCoaches(coaches);
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    // MULTI-PROFESSOR: Encerrar sessão do coach
+    if (coach) {
+      await endCoachSession(coach.id);
+    }
+    
     setCoach(null);
     localStorage.removeItem('iron_coach_session');
+    setActiveCoaches([]);
+    setSuggestedMemberId(null);
   };
 
   const handleSelectFromSidebar = (entryName: string) => {
@@ -581,7 +690,19 @@ export default function Dashboard() {
     setAttendanceTimer(maxTime);
     setIsContinued(false);
     setContinuedStartTime(null);
+    setLongAttendanceNotified(false); // Reset notificação de atendimento longo
+    setShowTimeExceededAlert(false); // Reset alerta visual
+    
     await startAttendance(member.id, coach?.id);
+    
+    // MULTI-PROFESSOR: Marcar que está atendendo este aluno
+    if (coach) {
+      const result = await coachStartAttending(coach.id, coach.name, member.id);
+      if (result.reassignNeeded) {
+        // Outro coach tinha esse aluno sugerido, será re-calculado automaticamente
+        console.log('🔄 Sugestão será recalculada para outro coach');
+      }
+    }
     
     // Log de início de atendimento
     logAttendanceStart(
@@ -628,6 +749,9 @@ export default function Dashboard() {
     
     await endAttendance(activeAttendance.member.id, 'completed', coach.name);
     
+    // MULTI-PROFESSOR: Marcar que terminou de atender
+    await coachEndAttending(coach.id, activeAttendance.member.id);
+    
     if (!isMuted) {
       playSound('success');
       vibrateSuccess();
@@ -655,13 +779,49 @@ export default function Dashboard() {
     setActiveAttendance(null);
     setIsContinued(false);
     setContinuedStartTime(null);
+    setLongAttendanceNotified(false); // Reset
+    setShowTimeExceededAlert(false); // Reset
     loadQueue();
   };
 
-  const cancelAttendance = () => {
+  const cancelAttendance = async () => {
+    // MULTI-PROFESSOR: Liberar aluno se estava reservado
+    if (activeAttendance && coach) {
+      await coachEndAttending(coach.id, activeAttendance.member.id);
+    }
     setActiveAttendance(null);
     setIsContinued(false);
     setContinuedStartTime(null);
+    setLongAttendanceNotified(false);
+    setShowTimeExceededAlert(false);
+  };
+
+  // MULTI-PROFESSOR: Pausar sessão (lanche, banheiro, etc)
+  const handlePauseSession = async (reason: string) => {
+    if (!coach) return;
+    
+    // Se estiver atendendo, finalizar primeiro
+    if (activeAttendance) {
+      await finishAttendance();
+    }
+    
+    await pauseCoachSession(coach.id, reason);
+    setShowPauseModal(false);
+    
+    // Atualizar lista de coaches
+    const coaches = await getActiveCoaches();
+    setActiveCoaches(coaches);
+  };
+
+  // MULTI-PROFESSOR: Retomar sessão
+  const handleResumeSession = async () => {
+    if (!coach) return;
+    
+    await startCoachSession(coach.id, coach.name);
+    
+    // Atualizar lista de coaches
+    const coaches = await getActiveCoaches();
+    setActiveCoaches(coaches);
   };
 
   // Checkout: move aluno para "Finalizados" ao invés de remover completamente
@@ -963,6 +1123,34 @@ export default function Dashboard() {
             </div>
           </div>
           <div className="w-px h-8 bg-white/10" />
+          
+          {/* MULTI-PROFESSOR: Indicador de coaches ativos */}
+          {activeCoaches.length > 1 && (
+            <div className="flex items-center gap-1 px-2 py-1 bg-green-500/10 border border-green-500/20 rounded-lg">
+              <span className="text-green-400 text-sm">👥</span>
+              <span className="text-green-400 text-xs font-medium">{activeCoaches.length} ativos</span>
+              <div className="flex -space-x-1 ml-1">
+                {activeCoaches.slice(0, 3).map((c, i) => (
+                  <div
+                    key={c.coachId}
+                    className={`w-5 h-5 rounded-full flex items-center justify-center text-[8px] font-bold border-2 border-black ${
+                      c.status === 'PAUSED' ? 'bg-yellow-500/50 text-yellow-200' :
+                      c.currentQueueId ? 'bg-blue-500 text-white' : 'bg-green-500 text-white'
+                    }`}
+                    title={`${c.coachName}${c.status === 'PAUSED' ? ' (pausado)' : c.currentQueueId ? ' (atendendo)' : ' (livre)'}`}
+                  >
+                    {c.coachName.split(' ').map(n => n[0]).slice(0, 2).join('')}
+                  </div>
+                ))}
+                {activeCoaches.length > 3 && (
+                  <div className="w-5 h-5 rounded-full bg-white/20 flex items-center justify-center text-[8px] font-bold border-2 border-black text-white/60">
+                    +{activeCoaches.length - 3}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+          
           {/* BOTÃO FILTRO PRIORIDADES MÁXIMAS */}
           <button 
             onClick={() => setShowPriorityFilter(!showPriorityFilter)} 
@@ -978,6 +1166,16 @@ export default function Dashboard() {
           <button onClick={toggleMute} className={`p-2 rounded-lg transition-colors ${isMuted ? 'bg-red-500/20 text-red-400' : 'hover:bg-white/5 text-white/40'}`}>
             {isMuted ? '🔇' : '🔊'}
           </button>
+          
+          {/* MULTI-PROFESSOR: Botão de pausar */}
+          <button
+            onClick={() => setShowPauseModal(true)}
+            className="p-2 rounded-lg hover:bg-yellow-500/20 text-yellow-400/60 hover:text-yellow-400 transition-colors"
+            title="Pausar (lanche, banheiro...)"
+          >
+            ⏸️
+          </button>
+          
           <button onClick={handleLogout} className="flex items-center gap-2 hover:bg-white/5 rounded-lg px-2 py-1" title="Sair">
             <div className="w-8 h-8 rounded-full bg-[#FF3B30]/20 flex items-center justify-center text-xs font-bold text-[#FF3B30]">{coach.initials}</div>
           </button>
@@ -1039,20 +1237,30 @@ export default function Dashboard() {
               }}
             >
               <AnimatePresence mode="popLayout">
-                {regularQueue.map((member) => (
-                  <MemberCard
-                    key={member.id}
-                    ref={(el) => { if (el) cardRefs.current.set(member.id, el); else cardRefs.current.delete(member.id); }}
-                    member={member}
-                    isActive={activeAttendance?.member.id === member.id}
-                    isSelected={selectedMemberId === member.id}
-                    onAttend={() => startAttendanceFlow(member)}
-                    onCheckout={() => { console.log('👋 Checkout clicado:', member.name, member.id); setCheckoutModal(member); }}
-                    onViewDetails={() => setViewDetailsMember(member)}
-                    onSkip={() => setSkipModal(member)}
-                    isDimmed={showPriorityFilter && member.daysAsMember > 14}
-                  />
-                ))}
+                {regularQueue.map((member) => {
+                  // FASE 2: Verificar se é sugerido para este coach
+                  const isSuggested = suggestedMemberId === member.id;
+                  // FASE 2: Verificar se está sendo atendido por outro coach
+                  const attendingCoach = activeCoaches.find(c => c.currentQueueId === member.id && c.coachId !== coach?.id);
+                  const beingAttendedBy = attendingCoach?.coachName;
+                  
+                  return (
+                    <MemberCard
+                      key={member.id}
+                      ref={(el) => { if (el) cardRefs.current.set(member.id, el); else cardRefs.current.delete(member.id); }}
+                      member={member}
+                      isActive={activeAttendance?.member.id === member.id}
+                      isSelected={selectedMemberId === member.id}
+                      onAttend={() => startAttendanceFlow(member)}
+                      onCheckout={() => { console.log('👋 Checkout clicado:', member.name, member.id); setCheckoutModal(member); }}
+                      onViewDetails={() => setViewDetailsMember(member)}
+                      onSkip={() => setSkipModal(member)}
+                      isDimmed={showPriorityFilter && member.daysAsMember > 14}
+                      isSuggested={isSuggested}
+                      beingAttendedBy={beingAttendedBy}
+                    />
+                  );
+                })}
               </AnimatePresence>
             </div>
 
@@ -1278,6 +1486,87 @@ export default function Dashboard() {
             onConfirm={(reason) => handleSkip(skipModal, reason)}
             isLoading={isSkipping}
           />
+        )}
+      </AnimatePresence>
+
+      {/* FASE 2: Modal de Pausar Sessão */}
+      <AnimatePresence>
+        {showPauseModal && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-[100] p-4"
+            onClick={() => setShowPauseModal(false)}
+          >
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              onClick={e => e.stopPropagation()}
+              className="bg-zinc-900 rounded-2xl p-6 w-full max-w-sm border border-white/10"
+            >
+              <div className="text-center mb-6">
+                <div className="w-16 h-16 rounded-2xl bg-yellow-500/20 flex items-center justify-center mx-auto mb-4">
+                  <span className="text-3xl">⏸️</span>
+                </div>
+                <h3 className="text-xl font-bold text-white">Pausar Sessão</h3>
+                <p className="text-white/50 text-sm mt-1">Selecione o motivo da pausa</p>
+              </div>
+              
+              <div className="space-y-2 mb-6">
+                {[
+                  { icon: '🍽️', label: 'Lanche / Refeição', value: 'Lanche' },
+                  { icon: '🚻', label: 'Banheiro', value: 'Banheiro' },
+                  { icon: '☕', label: 'Café / Descanso', value: 'Descanso' },
+                  { icon: '📞', label: 'Ligação / Urgência', value: 'Ligação' },
+                  { icon: '📋', label: 'Tarefa Administrativa', value: 'Administrativa' },
+                ].map(item => (
+                  <button
+                    key={item.value}
+                    onClick={() => handlePauseSession(item.value)}
+                    className="w-full p-4 bg-white/5 hover:bg-yellow-500/20 border border-white/10 hover:border-yellow-500/30 rounded-xl text-left transition-all flex items-center gap-3"
+                  >
+                    <span className="text-2xl">{item.icon}</span>
+                    <span className="text-white font-medium">{item.label}</span>
+                  </button>
+                ))}
+              </div>
+              
+              <button
+                onClick={() => setShowPauseModal(false)}
+                className="w-full py-3 bg-white/5 hover:bg-white/10 rounded-xl font-medium transition-colors"
+              >
+                Cancelar
+              </button>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* FASE 2: Alerta de Tempo Excedido */}
+      <AnimatePresence>
+        {showTimeExceededAlert && activeAttendance && (
+          <motion.div
+            initial={{ opacity: 0, y: -20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -20 }}
+            className="fixed top-20 left-1/2 -translate-x-1/2 z-[90] px-6 py-3 bg-red-500/90 backdrop-blur-sm rounded-xl border border-red-400/50 shadow-2xl shadow-red-500/30"
+          >
+            <div className="flex items-center gap-3">
+              <span className="text-2xl animate-pulse">⚠️</span>
+              <div>
+                <p className="font-bold text-white">TEMPO EXCEDIDO</p>
+                <p className="text-sm text-white/80">Atendimento passou de 1 minuto • Supervisor notificado</p>
+              </div>
+              <button
+                onClick={() => setShowTimeExceededAlert(false)}
+                className="ml-4 p-1 hover:bg-white/20 rounded-lg transition-colors"
+              >
+                ✕
+              </button>
+            </div>
+          </motion.div>
         )}
       </AnimatePresence>
 
@@ -1684,7 +1973,9 @@ const MemberCard = forwardRef<HTMLDivElement, {
   onReactivate?: () => void; // Reativar card de Personal para fila normal
   isPassive?: boolean;
   isDimmed?: boolean; // Para filtro de prioridade máxima
-}>(({ member, isActive, isSelected, onAttend, onCheckout, onViewDetails, onSkip, onReactivate, isPassive, isDimmed }, ref) => {
+  isSuggested?: boolean; // FASE 2: Card sugerido para este coach
+  beingAttendedBy?: string; // FASE 2: Nome do coach que está atendendo
+}>(({ member, isActive, isSelected, onAttend, onCheckout, onViewDetails, onSkip, onReactivate, isPassive, isDimmed, isSuggested, beingAttendedBy }, ref) => {
   const p = PRIORITY_CONFIG[member.priority] || PRIORITY_CONFIG.YELLOW;
   const [showChurnAlert, setShowChurnAlert] = useState(false); // Alerta de desistência
   const [showCriticalOverlay, setShowCriticalOverlay] = useState(false); // Overlay triângulo para retenção crítica
@@ -2028,6 +2319,45 @@ const MemberCard = forwardRef<HTMLDivElement, {
             </span>
           )}
         </div>
+        
+        {/* FASE 2: Indicador de sugestão */}
+        {isSuggested && !beingAttendedBy && (
+          <div 
+            className="flex items-center gap-1.5 mb-2"
+            style={{
+              fontSize: '9px',
+              padding: '4px 8px',
+              borderRadius: '10px',
+              background: 'linear-gradient(135deg, rgba(59, 130, 246, 0.2) 0%, rgba(37, 99, 235, 0.2) 100%)',
+              color: '#60A5FA',
+              border: '1px solid rgba(59, 130, 246, 0.4)',
+              width: 'fit-content',
+              fontWeight: 600,
+              animation: 'pulse 2s ease-in-out infinite',
+            }}
+          >
+            🎯 SUGERIDO PARA VOCÊ
+          </div>
+        )}
+        
+        {/* FASE 2: Indicador de quem está atendendo */}
+        {beingAttendedBy && (
+          <div 
+            className="flex items-center gap-1.5 mb-2"
+            style={{
+              fontSize: '9px',
+              padding: '4px 8px',
+              borderRadius: '10px',
+              background: 'rgba(99, 102, 241, 0.15)',
+              color: '#A5B4FC',
+              border: '1px solid rgba(99, 102, 241, 0.3)',
+              width: 'fit-content',
+              fontWeight: 600,
+            }}
+          >
+            👨‍🏫 {beingAttendedBy} atendendo
+          </div>
+        )}
         
         {wasAttended && (
           <div 

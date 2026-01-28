@@ -1072,3 +1072,254 @@ export async function unmarkAsPersonal(queueId: string): Promise<boolean> {
     return false;
   }
 }
+
+// ============================================================================
+// MULTI-PROFESSOR - Funções para gerenciar múltiplos coaches no salão
+// ============================================================================
+
+export interface CoachSession {
+  sessionId: string;
+  coachId: string;
+  coachName: string;
+  status: 'ACTIVE' | 'PAUSED' | 'OFFLINE';
+  currentQueueId: string | null;
+  suggestedQueueId: string | null;
+  pauseReason: string | null;
+  lastActivityAt: string;
+}
+
+export interface SuggestedMember {
+  id: string;
+  member_name: string;
+  priority: Priority;
+  check_in_time: string;
+}
+
+/**
+ * Inicia ou reativa sessão do coach no salão
+ */
+export async function startCoachSession(
+  coachId: string,
+  coachName: string
+): Promise<{ success: boolean; sessionId?: string }> {
+  try {
+    const { data, error } = await supabase.rpc('start_coach_session', {
+      p_coach_id: coachId,
+      p_coach_name: coachName,
+    });
+
+    if (error) {
+      console.error('Erro ao iniciar sessão:', error);
+      return { success: false };
+    }
+
+    return data as { success: boolean; sessionId?: string };
+  } catch (e) {
+    console.error('Exceção ao iniciar sessão:', e);
+    return { success: false };
+  }
+}
+
+/**
+ * Pausa a sessão do coach (lanche, banheiro, etc)
+ */
+export async function pauseCoachSession(
+  coachId: string,
+  reason: string = 'Pausa'
+): Promise<boolean> {
+  try {
+    const { error } = await supabase.rpc('pause_coach_session', {
+      p_coach_id: coachId,
+      p_reason: reason,
+    });
+
+    if (error) {
+      console.error('Erro ao pausar sessão:', error);
+      return false;
+    }
+
+    return true;
+  } catch (e) {
+    console.error('Exceção ao pausar sessão:', e);
+    return false;
+  }
+}
+
+/**
+ * Encerra a sessão do coach
+ */
+export async function endCoachSession(coachId: string): Promise<boolean> {
+  try {
+    const { error } = await supabase.rpc('end_coach_session', {
+      p_coach_id: coachId,
+    });
+
+    if (error) {
+      console.error('Erro ao encerrar sessão:', error);
+      return false;
+    }
+
+    return true;
+  } catch (e) {
+    console.error('Exceção ao encerrar sessão:', e);
+    return false;
+  }
+}
+
+/**
+ * Obtém o próximo aluno sugerido para o coach
+ */
+export async function getSuggestedMember(
+  coachId: string
+): Promise<{ suggested: SuggestedMember | null; reason?: string }> {
+  try {
+    const { data, error } = await supabase.rpc('get_suggested_member', {
+      p_coach_id: coachId,
+    });
+
+    if (error) {
+      console.error('Erro ao obter sugestão:', error);
+      return { suggested: null };
+    }
+
+    return {
+      suggested: data?.suggested || null,
+      reason: data?.reason,
+    };
+  } catch (e) {
+    console.error('Exceção ao obter sugestão:', e);
+    return { suggested: null };
+  }
+}
+
+/**
+ * Marca que o coach começou a atender um aluno
+ */
+export async function coachStartAttending(
+  coachId: string,
+  coachName: string,
+  queueId: string
+): Promise<{ success: boolean; reassignNeeded?: boolean; previousCoachId?: string }> {
+  try {
+    const { data, error } = await supabase.rpc('coach_start_attending', {
+      p_coach_id: coachId,
+      p_coach_name: coachName,
+      p_queue_id: queueId,
+    });
+
+    if (error) {
+      console.error('Erro ao iniciar atendimento:', error);
+      return { success: false };
+    }
+
+    return data as { success: boolean; reassignNeeded?: boolean; previousCoachId?: string };
+  } catch (e) {
+    console.error('Exceção ao iniciar atendimento:', e);
+    return { success: false };
+  }
+}
+
+/**
+ * Marca que o coach terminou de atender
+ */
+export async function coachEndAttending(
+  coachId: string,
+  queueId: string
+): Promise<boolean> {
+  try {
+    const { error } = await supabase.rpc('coach_end_attending', {
+      p_coach_id: coachId,
+      p_queue_id: queueId,
+    });
+
+    if (error) {
+      console.error('Erro ao finalizar atendimento:', error);
+      return false;
+    }
+
+    return true;
+  } catch (e) {
+    console.error('Exceção ao finalizar atendimento:', e);
+    return false;
+  }
+}
+
+/**
+ * Obtém lista de coaches ativos no salão
+ */
+export async function getActiveCoaches(): Promise<CoachSession[]> {
+  try {
+    const { data, error } = await supabase.rpc('get_active_coaches');
+
+    if (error) {
+      console.error('Erro ao obter coaches ativos:', error);
+      return [];
+    }
+
+    return (data?.coaches || []) as CoachSession[];
+  } catch (e) {
+    console.error('Exceção ao obter coaches ativos:', e);
+    return [];
+  }
+}
+
+/**
+ * Notifica supervisor sobre atendimento longo (> 1 minuto)
+ */
+export async function notifyLongAttendance(
+  coachId: string,
+  coachName: string,
+  queueId: string,
+  memberName: string,
+  priority: string,
+  durationSeconds: number
+): Promise<boolean> {
+  try {
+    const { error } = await supabase.rpc('notify_long_attendance', {
+      p_coach_id: coachId,
+      p_coach_name: coachName,
+      p_queue_id: queueId,
+      p_member_name: memberName,
+      p_priority: priority,
+      p_duration_seconds: durationSeconds,
+    });
+
+    if (error) {
+      console.error('Erro ao notificar atendimento longo:', error);
+      return false;
+    }
+
+    return true;
+  } catch (e) {
+    console.error('Exceção ao notificar atendimento longo:', e);
+    return false;
+  }
+}
+
+/**
+ * Subscreve para atualizações de sessões de coaches
+ */
+export function subscribeToCoachSessions(
+  callback: (sessions: CoachSession[]) => void
+): () => void {
+  const channel = supabase
+    .channel('coach_sessions_changes')
+    .on(
+      'postgres_changes',
+      {
+        event: '*',
+        schema: 'public',
+        table: 'coach_sessions',
+      },
+      async () => {
+        // Quando houver mudança, buscar lista atualizada
+        const sessions = await getActiveCoaches();
+        callback(sessions);
+      }
+    )
+    .subscribe();
+
+  return () => {
+    supabase.removeChannel(channel);
+  };
+}
