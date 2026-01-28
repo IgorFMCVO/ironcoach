@@ -614,6 +614,7 @@ export default function Dashboard() {
     
     const xpResult = await recordIntervention({
       coachId: coach.id,
+      coachName: coach.name,  // Adicionado para salvar nome nos relatórios
       queueId: activeAttendance.member.id,
       memberName: activeAttendance.member.name,
       memberPriority: activeAttendance.member.priority,

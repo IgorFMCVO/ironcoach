@@ -192,33 +192,94 @@ export default function AdminPage() {
 
   // Criar coach
   const createCoach = async (data: { name: string; initials: string; pin: string; role: 'ADMIN' | 'SUPERVISOR' | 'PROFESSOR' }) => {
-    const { error } = await supabase.rpc('create_coach', {
-      p_name: data.name,
-      p_initials: data.initials,
-      p_pin: data.pin,
-      p_role: data.role,
-    });
-    
-    if (!error) {
+    try {
+      // Primeiro, tentar via RPC
+      const { data: rpcResult, error: rpcError } = await supabase.rpc('create_coach', {
+        p_name: data.name,
+        p_initials: data.initials,
+        p_pin: data.pin,
+        p_role: data.role,
+      });
+      
+      if (!rpcError) {
+        loadCoaches();
+        setShowAddModal(false);
+        return;
+      }
+      
+      console.log('RPC create_coach não disponível, usando INSERT direto:', rpcError.message);
+      
+      // Fallback: INSERT direto na tabela coaches
+      const { error: insertError } = await supabase
+        .from('coaches')
+        .insert({
+          name: data.name,
+          initials: data.initials.toUpperCase(),
+          pin: data.pin,
+          role: data.role,
+          is_active: true,
+          is_supervisor: data.role === 'SUPERVISOR' || data.role === 'ADMIN',
+        });
+      
+      if (insertError) {
+        console.error('Erro ao criar coach:', insertError);
+        alert(`Erro ao criar usuário: ${insertError.message}`);
+        return;
+      }
+      
       loadCoaches();
       setShowAddModal(false);
+    } catch (err) {
+      console.error('Exceção ao criar coach:', err);
+      alert('Erro inesperado ao criar usuário');
     }
   };
 
   // Atualizar coach
   const updateCoach = async (id: string, data: Partial<Coach>) => {
-    const { error } = await supabase.rpc('update_coach', {
-      p_coach_id: id,
-      p_name: data.name,
-      p_initials: data.initials,
-      p_pin: data.pin,
-      p_role: data.role,
-      p_is_active: data.is_active,
-    });
-    
-    if (!error) {
+    try {
+      // Primeiro, tentar via RPC
+      const { error: rpcError } = await supabase.rpc('update_coach', {
+        p_coach_id: id,
+        p_name: data.name,
+        p_initials: data.initials,
+        p_pin: data.pin,
+        p_role: data.role,
+        p_is_active: data.is_active,
+      });
+      
+      if (!rpcError) {
+        loadCoaches();
+        setEditingCoach(null);
+        return;
+      }
+      
+      console.log('RPC update_coach não disponível, usando UPDATE direto:', rpcError.message);
+      
+      // Fallback: UPDATE direto na tabela
+      const { error: updateError } = await supabase
+        .from('coaches')
+        .update({
+          name: data.name,
+          initials: data.initials?.toUpperCase(),
+          pin: data.pin,
+          role: data.role,
+          is_active: data.is_active,
+          is_supervisor: data.role === 'SUPERVISOR' || data.role === 'ADMIN',
+        })
+        .eq('id', id);
+      
+      if (updateError) {
+        console.error('Erro ao atualizar coach:', updateError);
+        alert(`Erro ao atualizar: ${updateError.message}`);
+        return;
+      }
+      
       loadCoaches();
       setEditingCoach(null);
+    } catch (err) {
+      console.error('Exceção ao atualizar coach:', err);
+      alert('Erro inesperado ao atualizar');
     }
   };
 
@@ -226,8 +287,34 @@ export default function AdminPage() {
   const deleteCoach = async (id: string) => {
     if (!confirm('Tem certeza que deseja remover este usuário?')) return;
     
-    await supabase.rpc('delete_coach', { p_coach_id: id });
-    loadCoaches();
+    try {
+      // Primeiro, tentar via RPC
+      const { error: rpcError } = await supabase.rpc('delete_coach', { p_coach_id: id });
+      
+      if (!rpcError) {
+        loadCoaches();
+        return;
+      }
+      
+      console.log('RPC delete_coach não disponível, usando DELETE direto:', rpcError.message);
+      
+      // Fallback: DELETE direto
+      const { error: deleteError } = await supabase
+        .from('coaches')
+        .delete()
+        .eq('id', id);
+      
+      if (deleteError) {
+        console.error('Erro ao deletar coach:', deleteError);
+        alert(`Erro ao remover: ${deleteError.message}`);
+        return;
+      }
+      
+      loadCoaches();
+    } catch (err) {
+      console.error('Exceção ao deletar coach:', err);
+      alert('Erro inesperado ao remover');
+    }
   };
 
   // Toggle ativo/inativo

@@ -452,6 +452,7 @@ const PRIORITY_BONUS: Record<Priority, number> = {
 
 export async function recordIntervention(data: {
   coachId: string;
+  coachName: string;  // Adicionado para salvar nome do coach
   queueId: string;
   memberName: string;
   memberPriority: Priority;
@@ -488,6 +489,7 @@ export async function recordIntervention(data: {
     .insert({
       queue_id: data.queueId,
       coach_id: data.coachId,
+      coach_name: data.coachName,  // Salvar nome do coach
       intervention_type: data.interventionType,
       duration_seconds: data.durationSeconds,
       alert_type: data.alertType || null,

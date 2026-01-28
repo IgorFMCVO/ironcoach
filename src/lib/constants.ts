@@ -220,6 +220,15 @@ export const CHECKOUT_REASONS = [
 
 export const COORDINATION_REQUEST_TYPES = [
   { 
+    id: 'SKIPPED_MEMBER', 
+    label: 'Aluno Pulado 3x', 
+    icon: '⏭️',
+    description: 'Aluno foi pulado 3 ou mais vezes',
+    color: '#EF4444',
+    suggestedActions: ['Verificar situação', 'Conversar com aluno', 'Avaliar motivos'],
+    isUrgent: true,
+  },
+  { 
     id: 'VERIFY_FREQUENCY', 
     label: 'Verificar Frequência', 
     icon: '📊',

@@ -823,27 +823,72 @@ export function isWorkoutExpired(expirationDate: string | null | undefined): boo
  */
 export async function searchMembersByName(name: string): Promise<EvoMember[]> {
   try {
-    const response = await fetch(
-      `${EVO_API_BASE}/members?name=${encodeURIComponent(name)}&take=20`,
-      {
-        method: 'GET',
-        headers: getHeaders(),
-      }
-    );
+    const searchTerm = name.trim();
+    if (searchTerm.length < 2) return [];
+    
+    // Fazer duas buscas em paralelo: por firstName e por lastName
+    const [responseFirst, responseLast] = await Promise.all([
+      // Busca por firstName (parâmetro name)
+      fetch(
+        `${EVO_API_BASE}/members?name=${encodeURIComponent(searchTerm)}&take=30`,
+        { method: 'GET', headers: getHeaders() }
+      ),
+      // Busca por lastName 
+      fetch(
+        `${EVO_API_BASE}/members?lastName=${encodeURIComponent(searchTerm)}&take=30`,
+        { method: 'GET', headers: getHeaders() }
+      )
+    ]);
 
-    if (!response.ok) {
-      console.error('Erro ao buscar membros:', response.status);
-      return [];
+    let allResults: any[] = [];
+    const existingIds = new Set<number>();
+
+    // Processar resultados da busca por nome
+    if (responseFirst.ok) {
+      const dataFirst = await responseFirst.json();
+      if (Array.isArray(dataFirst)) {
+        dataFirst.forEach((m: any) => {
+          if (!existingIds.has(m.idMember)) {
+            existingIds.add(m.idMember);
+            allResults.push(m);
+          }
+        });
+      }
     }
 
-    const data = await response.json();
+    // Processar resultados da busca por sobrenome
+    if (responseLast.ok) {
+      const dataLast = await responseLast.json();
+      if (Array.isArray(dataLast)) {
+        dataLast.forEach((m: any) => {
+          if (!existingIds.has(m.idMember)) {
+            existingIds.add(m.idMember);
+            allResults.push(m);
+          }
+        });
+      }
+    }
+
+    // Filtro adicional para garantir relevância
+    const searchTermLower = searchTerm.toLowerCase();
+    const searchTerms = searchTermLower.split(' ').filter(t => t.length > 0);
     
-    if (!Array.isArray(data)) return [];
+    allResults = allResults.filter((member: any) => {
+      const firstName = (member.firstName || '').toLowerCase();
+      const lastName = (member.lastName || '').toLowerCase();
+      const fullName = `${firstName} ${lastName}`;
+      
+      // Match se qualquer termo de busca está no nome
+      return searchTerms.some(term => 
+        firstName.includes(term) || 
+        lastName.includes(term) ||
+        fullName.includes(term)
+      );
+    });
     
     // Garantir que cada membro tenha o nome completo
-    return data.map((member: any) => ({
+    return allResults.map((member: any) => ({
       ...member,
-      // Compor nome completo se não existir
       name: member.name || 
         [member.firstName, member.lastName].filter(Boolean).join(' ') ||
         `Aluno #${member.idMember}`,

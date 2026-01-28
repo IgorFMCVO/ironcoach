@@ -99,6 +99,18 @@ export interface QueueMember {
   helpRequested: boolean;
   isFirstVisit: boolean;
   hasNewProgram: boolean;
+  
+  // Campos de pulo de atendimento
+  skipCount?: number;
+  skipHistory?: Array<{
+    skipNumber: number;
+    skippedAt: string;
+    skippedBy: string;
+    reason: string;
+    newPosition: number;
+  }>;
+  lastSkippedAt?: string;
+  lastSkippedBy?: string;
 }
 
 export interface CheckInRequest {
