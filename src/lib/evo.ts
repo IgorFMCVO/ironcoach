@@ -1312,3 +1312,198 @@ export async function enrollMemberInAppointment(
   
   return { success: false, error: 'Não foi possível realizar o agendamento no EVO' };
 }
+
+// ============================================================================
+// TREINOS / FICHAS - Buscar treinos completos do cliente
+// ============================================================================
+
+/**
+ * Item de exercício dentro de uma série
+ */
+export interface EvoWorkoutItem {
+  idItem: number;
+  idExercicio: number;
+  nomeExercicio: string;
+  ordem: number;
+  series: string;
+  repeticoes: string;
+  carga: string;
+  tempoDescanso: string;
+  observacao: string;
+  urlVideo?: string;
+  urlImagem?: string;
+  grupoMuscular?: string;
+}
+
+/**
+ * Série dentro de um treino
+ */
+export interface EvoWorkoutSeries {
+  idSerie: number;
+  nome: string;
+  ordem: number;
+  observacao: string;
+  itens: EvoWorkoutItem[];
+  sessoesConcluidas: number;
+}
+
+/**
+ * Treino completo do cliente
+ */
+export interface EvoWorkoutComplete {
+  idTreino: number;
+  nomeTreino: string;
+  dataCriacao: string;
+  dataInicio: string;
+  dataValidade: string;
+  observacao: string;
+  idProfessor: number;
+  nomeProfessor: string;
+  quantidadeSessoes: number;
+  quantidadeSemanal: number;
+  frequenciaSemana: number;
+  sessoesConcluidas: number;
+  statusTreino: number;
+  idSerieAtual: number;
+  treinoPadrao: boolean;
+  flExcluido: boolean;
+  flTreinoV2: boolean;
+  permiteImprimir: boolean;
+  series: EvoWorkoutSeries[];
+  tags?: { idTagTreino: number; nome: string }[];
+}
+
+/**
+ * Resposta da API de treinos
+ */
+export interface EvoWorkoutResponse {
+  id: number;
+  idCliente: number;
+  nome: string;
+  urlFoto: string;
+  treinos: EvoWorkoutComplete[];
+}
+
+/**
+ * Busca todos os treinos de um cliente pelo ID
+ * @param idClient ID do cliente no EVO
+ * @param includeInactive Incluir treinos inativos (default: false)
+ * @param includeDeleted Incluir treinos excluídos (default: false)
+ */
+export async function getClientWorkouts(
+  idClient: number,
+  includeInactive: boolean = false,
+  includeDeleted: boolean = false
+): Promise<EvoWorkoutResponse | null> {
+  try {
+    const params = new URLSearchParams({
+      idClient: idClient.toString(),
+      inactive: includeInactive.toString(),
+      deleted: includeDeleted.toString(),
+    });
+
+    console.log(`[EVO] Buscando treinos do cliente ${idClient}...`);
+
+    const response = await fetch(
+      `${EVO_API_BASE}/workout/default-client-workout?${params}`,
+      {
+        method: 'GET',
+        headers: getHeaders(),
+      }
+    );
+
+    if (!response.ok) {
+      console.error(`[EVO] Erro ao buscar treinos: ${response.status} ${response.statusText}`);
+      return null;
+    }
+
+    const data = await response.json();
+    console.log(`[EVO] ✅ Treinos encontrados: ${data.treinos?.length || 0}`);
+    
+    return data;
+  } catch (error) {
+    console.error('[EVO] Exceção ao buscar treinos:', error);
+    return null;
+  }
+}
+
+/**
+ * Busca um treino específico pelo ID
+ * @param idWorkout ID do treino no EVO
+ */
+export async function getWorkoutById(
+  idWorkout: number
+): Promise<EvoWorkoutComplete | null> {
+  try {
+    console.log(`[EVO] Buscando treino ${idWorkout}...`);
+
+    const response = await fetch(
+      `${EVO_API_BASE}/workout/default-client-workout?idWorkout=${idWorkout}`,
+      {
+        method: 'GET',
+        headers: getHeaders(),
+      }
+    );
+
+    if (!response.ok) {
+      console.error(`[EVO] Erro ao buscar treino: ${response.status} ${response.statusText}`);
+      return null;
+    }
+
+    const data = await response.json();
+    
+    // A API retorna os treinos dentro de um objeto
+    if (data.treinos && data.treinos.length > 0) {
+      return data.treinos[0];
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('[EVO] Exceção ao buscar treino:', error);
+    return null;
+  }
+}
+
+/**
+ * Formata o status do treino para exibição
+ */
+export function getWorkoutStatusLabel(status: number): { label: string; color: string } {
+  switch (status) {
+    case 0:
+      return { label: 'Pendente', color: '#FF9500' };
+    case 1:
+      return { label: 'Em andamento', color: '#30D158' };
+    case 2:
+      return { label: 'Concluído', color: '#007AFF' };
+    case 3:
+      return { label: 'Expirado', color: '#FF3B30' };
+    default:
+      return { label: 'Desconhecido', color: '#8E8E93' };
+  }
+}
+
+/**
+ * Verifica se um treino está válido (dentro do período de validade)
+ */
+export function isWorkoutValid(workout: EvoWorkoutComplete): boolean {
+  if (!workout.dataValidade) return true;
+  
+  const today = new Date();
+  const validUntil = new Date(workout.dataValidade);
+  
+  return today <= validUntil;
+}
+
+/**
+ * Calcula dias restantes de validade do treino
+ */
+export function getWorkoutDaysRemaining(workout: EvoWorkoutComplete): number {
+  if (!workout.dataValidade) return 999;
+  
+  const today = new Date();
+  const validUntil = new Date(workout.dataValidade);
+  const diffTime = validUntil.getTime() - today.getTime();
+  const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+  
+  return Math.max(0, diffDays);
+}

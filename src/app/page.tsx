@@ -62,7 +62,17 @@ import {
   getActiveCoaches,
   notifyLongAttendance,
   subscribeToCoachSessions,
+  // Cardio
+  startMemberCardio,
+  finishMemberCardio,
+  getCardioMembers,
+  subscribeToCardioMembers,
+  // Usuários Online
+  getAllOnlineUsers,
   type CoachSession,
+  type CardioMember,
+  type OnlineUser,
+  type OnlineUsersData,
   type QueueMember as DBQueueMember,
   type Priority,
   type InterventionType as DBInterventionType,
@@ -370,6 +380,15 @@ export default function Dashboard() {
   const [showPauseModal, setShowPauseModal] = useState(false);
   const [showTimeExceededAlert, setShowTimeExceededAlert] = useState(false);
   
+  // SISTEMA DE CARDIO
+  const [cardioMembers, setCardioMembers] = useState<CardioMember[]>([]);
+  const [showCardioModal, setShowCardioModal] = useState(false);
+  const [cardioConfig, setCardioConfig] = useState({ duration: 15, destination: 'QUEUE' as 'QUEUE' | 'FINISHED' });
+  
+  // USUÁRIOS ONLINE
+  const [onlineUsers, setOnlineUsers] = useState<OnlineUsersData>({ coaches: [], consultoras: [], totalOnline: 0 });
+  const [showOnlineUsersPanel, setShowOnlineUsersPanel] = useState(false);
+  
   const { playSound, playAlert } = useAudio();
   const { vibrateSuccess } = useVibration();
   
@@ -637,6 +656,72 @@ export default function Dashboard() {
     return () => clearInterval(interval);
   }, [activeAttendance, coach, longAttendanceNotified, isMuted, playAlert, vibrateSuccess]);
 
+  // CARDIO: Carregar e subscrever membros em cardio
+  useEffect(() => {
+    if (!coach) return;
+    
+    // Carregar membros em cardio inicialmente
+    getCardioMembers().then(setCardioMembers);
+    
+    // Subscrever para atualizações
+    const unsub = subscribeToCardioMembers((members) => {
+      setCardioMembers(members);
+    });
+    
+    return () => unsub();
+  }, [coach]);
+
+  // CARDIO: Verificar timers de cardio e finalizar automaticamente
+  useEffect(() => {
+    if (cardioMembers.length === 0) return;
+    
+    const checkCardioTimers = () => {
+      const now = Date.now();
+      
+      cardioMembers.forEach(async (member) => {
+        const startedAt = new Date(member.cardioStartedAt).getTime();
+        const durationMs = member.cardioDurationMinutes * 60 * 1000;
+        const endTime = startedAt + durationMs;
+        
+        // Se o tempo acabou, finalizar cardio
+        if (now >= endTime) {
+          console.log(`🏃 Cardio finalizado automaticamente: ${member.memberName}`);
+          await finishMemberCardio(member.id);
+          
+          // Tocar som e recarregar
+          if (!isMuted) {
+            playSound('success');
+          }
+          
+          // Recarregar dados
+          loadQueue();
+          getCardioMembers().then(setCardioMembers);
+        }
+      });
+    };
+    
+    // Verificar a cada 5 segundos
+    const interval = setInterval(checkCardioTimers, 5000);
+    checkCardioTimers(); // Verificar imediatamente
+    
+    return () => clearInterval(interval);
+  }, [cardioMembers, isMuted, playSound, loadQueue]);
+
+  // USUÁRIOS ONLINE: Carregar e atualizar periodicamente
+  useEffect(() => {
+    if (!coach) return;
+    
+    // Carregar inicialmente
+    getAllOnlineUsers().then(setOnlineUsers);
+    
+    // Atualizar a cada 30 segundos
+    const interval = setInterval(() => {
+      getAllOnlineUsers().then(setOnlineUsers);
+    }, 30000);
+    
+    return () => clearInterval(interval);
+  }, [coach]);
+
   const handleLogin = async (c: Coach) => {
     setCoach(c);
     localStorage.setItem('iron_coach_session', JSON.stringify(c));
@@ -822,6 +907,57 @@ export default function Dashboard() {
     // Atualizar lista de coaches
     const coaches = await getActiveCoaches();
     setActiveCoaches(coaches);
+  };
+
+  // CARDIO: Iniciar cardio para o aluno em atendimento
+  const handleStartCardio = async () => {
+    if (!activeAttendance || !coach) return;
+    
+    const result = await startMemberCardio(
+      activeAttendance.member.id,
+      coach.id,
+      coach.name,
+      cardioConfig.duration,
+      cardioConfig.destination
+    );
+    
+    if (result.success) {
+      // Fechar modais
+      setShowCardioModal(false);
+      setActiveAttendance(null);
+      setIsContinued(false);
+      setContinuedStartTime(null);
+      setLongAttendanceNotified(false);
+      setShowTimeExceededAlert(false);
+      
+      // Tocar som
+      if (!isMuted) {
+        playSound('success');
+      }
+      
+      // Recarregar dados
+      loadQueue();
+      getCardioMembers().then(setCardioMembers);
+      
+      console.log(`🏃 Cardio iniciado: ${activeAttendance.member.name} - ${cardioConfig.duration}min - ${cardioConfig.destination === 'QUEUE' ? 'Volta para fila' : 'Finaliza treino'}`);
+    }
+  };
+
+  // CARDIO: Finalizar cardio manualmente (antes do tempo)
+  const handleFinishCardioEarly = async (memberId: string) => {
+    const result = await finishMemberCardio(memberId);
+    
+    if (result.success) {
+      if (!isMuted) {
+        playSound('success');
+      }
+      
+      // Recarregar dados
+      loadQueue();
+      getCardioMembers().then(setCardioMembers);
+      
+      console.log(`🏃 Cardio finalizado manualmente: ${memberId}`);
+    }
   };
 
   // Checkout: move aluno para "Finalizados" ao invés de remover completamente
@@ -1124,32 +1260,63 @@ export default function Dashboard() {
           </div>
           <div className="w-px h-8 bg-white/10" />
           
-          {/* MULTI-PROFESSOR: Indicador de coaches ativos */}
-          {activeCoaches.length > 1 && (
-            <div className="flex items-center gap-1 px-2 py-1 bg-green-500/10 border border-green-500/20 rounded-lg">
-              <span className="text-green-400 text-sm">👥</span>
-              <span className="text-green-400 text-xs font-medium">{activeCoaches.length} ativos</span>
-              <div className="flex -space-x-1 ml-1">
-                {activeCoaches.slice(0, 3).map((c, i) => (
-                  <div
-                    key={c.coachId}
-                    className={`w-5 h-5 rounded-full flex items-center justify-center text-[8px] font-bold border-2 border-black ${
-                      c.status === 'PAUSED' ? 'bg-yellow-500/50 text-yellow-200' :
-                      c.currentQueueId ? 'bg-blue-500 text-white' : 'bg-green-500 text-white'
-                    }`}
-                    title={`${c.coachName}${c.status === 'PAUSED' ? ' (pausado)' : c.currentQueueId ? ' (atendendo)' : ' (livre)'}`}
-                  >
-                    {c.coachName.split(' ').map(n => n[0]).slice(0, 2).join('')}
-                  </div>
-                ))}
-                {activeCoaches.length > 3 && (
-                  <div className="w-5 h-5 rounded-full bg-white/20 flex items-center justify-center text-[8px] font-bold border-2 border-black text-white/60">
-                    +{activeCoaches.length - 3}
-                  </div>
-                )}
-              </div>
+          {/* USUÁRIOS ONLINE - Clique para ver detalhes */}
+          <button
+            onClick={() => setShowOnlineUsersPanel(!showOnlineUsersPanel)}
+            className={`flex items-center gap-1 px-2 py-1 rounded-lg transition-all ${
+              showOnlineUsersPanel 
+                ? 'bg-green-500/30 border border-green-500/50' 
+                : 'bg-green-500/10 border border-green-500/20 hover:bg-green-500/20'
+            }`}
+            title="Ver usuários online"
+          >
+            <span className="text-green-400 text-sm">👥</span>
+            <span className="text-green-400 text-xs font-medium">{onlineUsers.totalOnline || activeCoaches.length} online</span>
+            <div className="flex -space-x-1 ml-1">
+              {/* Usar onlineUsers se disponível, senão activeCoaches */}
+              {onlineUsers.coaches.length > 0 ? (
+                <>
+                  {onlineUsers.coaches.slice(0, 3).map((c) => (
+                    <div
+                      key={c.sessionId}
+                      className={`w-5 h-5 rounded-full flex items-center justify-center text-[8px] font-bold border-2 border-black ${
+                        c.status === 'PAUSED' ? 'bg-yellow-500/50 text-yellow-200' :
+                        c.currentQueueId ? 'bg-blue-500 text-white' : 'bg-green-500 text-white'
+                      }`}
+                      title={`${c.name}${c.status === 'PAUSED' ? ' (pausado)' : c.currentQueueId ? ' (atendendo)' : ' (livre)'}`}
+                    >
+                      {c.name.split(' ').map(n => n[0]).slice(0, 2).join('')}
+                    </div>
+                  ))}
+                  {onlineUsers.coaches.length > 3 && (
+                    <div className="w-5 h-5 rounded-full bg-white/20 flex items-center justify-center text-[8px] font-bold border-2 border-black text-white/60">
+                      +{onlineUsers.coaches.length - 3}
+                    </div>
+                  )}
+                </>
+              ) : (
+                <>
+                  {activeCoaches.slice(0, 3).map((c) => (
+                    <div
+                      key={c.coachId}
+                      className={`w-5 h-5 rounded-full flex items-center justify-center text-[8px] font-bold border-2 border-black ${
+                        c.status === 'PAUSED' ? 'bg-yellow-500/50 text-yellow-200' :
+                        c.currentQueueId ? 'bg-blue-500 text-white' : 'bg-green-500 text-white'
+                      }`}
+                      title={`${c.coachName}${c.status === 'PAUSED' ? ' (pausado)' : c.currentQueueId ? ' (atendendo)' : ' (livre)'}`}
+                    >
+                      {c.coachName.split(' ').map(n => n[0]).slice(0, 2).join('')}
+                    </div>
+                  ))}
+                  {activeCoaches.length > 3 && (
+                    <div className="w-5 h-5 rounded-full bg-white/20 flex items-center justify-center text-[8px] font-bold border-2 border-black text-white/60">
+                      +{activeCoaches.length - 3}
+                    </div>
+                  )}
+                </>
+              )}
             </div>
-          )}
+          </button>
           
           {/* BOTÃO FILTRO PRIORIDADES MÁXIMAS */}
           <button 
@@ -1195,6 +1362,7 @@ export default function Dashboard() {
             onCancel={cancelAttendance}
             onContinue={enableContinuedAttendance}
             onNotify={() => setShowNotifyModal(activeAttendance.member)}
+            onCardio={() => setShowCardioModal(true)}
           />
         )}
       </AnimatePresence>
@@ -1308,6 +1476,36 @@ export default function Dashboard() {
                         />
                       );
                     })}
+                  </AnimatePresence>
+                </div>
+              </>
+            )}
+
+            {/* SEPARADOR - EXECUTANDO CARDIO */}
+            {cardioMembers.length > 0 && (
+              <>
+                <div className="flex items-center gap-3 my-6">
+                  <div className="flex-1 h-px bg-cyan-500/30" />
+                  <span className="text-xs text-cyan-400 font-bold">🏃 EXECUTANDO EXERCÍCIOS DE CARDIO ({cardioMembers.length})</span>
+                  <div className="flex-1 h-px bg-cyan-500/30" />
+                </div>
+
+                <div 
+                  className="grid gap-3" 
+                  style={{ 
+                    gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))',
+                    justifyItems: 'stretch',
+                    alignItems: 'stretch',
+                  }}
+                >
+                  <AnimatePresence mode="popLayout">
+                    {cardioMembers.map((member) => (
+                      <CardioMemberCard
+                        key={`cardio-${member.id}`}
+                        member={member}
+                        onFinishEarly={() => handleFinishCardioEarly(member.id)}
+                      />
+                    ))}
                   </AnimatePresence>
                 </div>
               </>
@@ -1570,6 +1768,300 @@ export default function Dashboard() {
         )}
       </AnimatePresence>
 
+      {/* MODAL DE CONFIGURAÇÃO DO CARDIO */}
+      <AnimatePresence>
+        {showCardioModal && activeAttendance && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-[100] p-4"
+            onClick={() => setShowCardioModal(false)}
+          >
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              onClick={e => e.stopPropagation()}
+              className="bg-zinc-900 rounded-2xl p-6 w-full max-w-md border border-cyan-500/20"
+            >
+              <div className="text-center mb-6">
+                <div className="w-16 h-16 rounded-2xl bg-cyan-500/20 flex items-center justify-center mx-auto mb-4">
+                  <span className="text-3xl">🏃</span>
+                </div>
+                <h3 className="text-xl font-bold text-white">Cardio</h3>
+                <p className="text-white/50 text-sm mt-1">
+                  {activeAttendance.member.name} vai fazer exercícios cardiovasculares
+                </p>
+              </div>
+              
+              {/* TEMPO DE CARDIO */}
+              <div className="mb-6">
+                <label className="text-sm text-white/60 font-medium block mb-3">
+                  ⏱️ Tempo de Cardio
+                </label>
+                <div className="grid grid-cols-4 gap-2">
+                  {[5, 10, 15, 20, 30, 45, 60, 90].map(min => (
+                    <button
+                      key={min}
+                      onClick={() => setCardioConfig(prev => ({ ...prev, duration: min }))}
+                      className={`py-3 rounded-lg font-bold text-sm transition-all ${
+                        cardioConfig.duration === min
+                          ? 'bg-cyan-500 text-white shadow-lg shadow-cyan-500/30'
+                          : 'bg-white/5 hover:bg-white/10 text-white/70'
+                      }`}
+                    >
+                      {min} min
+                    </button>
+                  ))}
+                </div>
+              </div>
+              
+              {/* DESTINO APÓS CARDIO */}
+              <div className="mb-6">
+                <label className="text-sm text-white/60 font-medium block mb-3">
+                  🎯 Após o cardio, o aluno:
+                </label>
+                <div className="space-y-2">
+                  <button
+                    onClick={() => setCardioConfig(prev => ({ ...prev, destination: 'QUEUE' }))}
+                    className={`w-full p-4 rounded-xl border transition-all flex items-center gap-3 ${
+                      cardioConfig.destination === 'QUEUE'
+                        ? 'bg-blue-500/20 border-blue-500/50 text-blue-400'
+                        : 'bg-white/5 border-white/10 text-white/70 hover:bg-white/10'
+                    }`}
+                  >
+                    <span className="text-2xl">🔄</span>
+                    <div className="text-left">
+                      <p className="font-bold">Volta para a Fila</p>
+                      <p className="text-xs opacity-70">Continua treino de musculação</p>
+                    </div>
+                    {cardioConfig.destination === 'QUEUE' && (
+                      <span className="ml-auto text-xl">✓</span>
+                    )}
+                  </button>
+                  <button
+                    onClick={() => setCardioConfig(prev => ({ ...prev, destination: 'FINISHED' }))}
+                    className={`w-full p-4 rounded-xl border transition-all flex items-center gap-3 ${
+                      cardioConfig.destination === 'FINISHED'
+                        ? 'bg-green-500/20 border-green-500/50 text-green-400'
+                        : 'bg-white/5 border-white/10 text-white/70 hover:bg-white/10'
+                    }`}
+                  >
+                    <span className="text-2xl">✅</span>
+                    <div className="text-left">
+                      <p className="font-bold">Finaliza o Treino</p>
+                      <p className="text-xs opacity-70">Vai direto para finalizados</p>
+                    </div>
+                    {cardioConfig.destination === 'FINISHED' && (
+                      <span className="ml-auto text-xl">✓</span>
+                    )}
+                  </button>
+                </div>
+              </div>
+              
+              {/* RESUMO */}
+              <div className="mb-6 p-4 bg-cyan-500/10 border border-cyan-500/20 rounded-xl">
+                <p className="text-cyan-400 text-sm text-center">
+                  <span className="font-bold">{activeAttendance.member.name}</span> fará 
+                  <span className="font-bold text-white"> {cardioConfig.duration} minutos </span> 
+                  de cardio e depois 
+                  <span className="font-bold text-white">
+                    {cardioConfig.destination === 'QUEUE' ? ' volta para a fila' : ' finaliza o treino'}
+                  </span>
+                </p>
+              </div>
+              
+              {/* BOTÕES */}
+              <div className="flex gap-3">
+                <button
+                  onClick={() => setShowCardioModal(false)}
+                  className="flex-1 py-3 bg-white/5 hover:bg-white/10 rounded-xl font-medium transition-colors"
+                >
+                  Cancelar
+                </button>
+                <button
+                  onClick={handleStartCardio}
+                  className="flex-1 py-3 bg-cyan-500 hover:bg-cyan-400 text-white rounded-xl font-bold transition-colors flex items-center justify-center gap-2"
+                >
+                  🏃 Iniciar Cardio
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* PAINEL DE USUÁRIOS ONLINE */}
+      <AnimatePresence>
+        {showOnlineUsersPanel && (
+          <motion.div
+            initial={{ opacity: 0, x: 20 }}
+            animate={{ opacity: 1, x: 0 }}
+            exit={{ opacity: 0, x: 20 }}
+            className="fixed top-20 right-4 z-[80] w-72 bg-zinc-900 border border-white/10 rounded-xl shadow-2xl overflow-hidden"
+          >
+            <div className="p-4 border-b border-white/10 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="text-lg">👥</span>
+                <h3 className="font-bold">Usuários Online</h3>
+              </div>
+              <button
+                onClick={() => setShowOnlineUsersPanel(false)}
+                className="p-1 hover:bg-white/10 rounded-lg transition-colors"
+              >
+                ✕
+              </button>
+            </div>
+            
+            <div className="max-h-96 overflow-y-auto">
+              {/* PROFESSORES */}
+              {(onlineUsers.coaches.length > 0 || activeCoaches.length > 0) && (
+                <div className="p-3 border-b border-white/5">
+                  <p className="text-xs text-white/40 font-bold mb-2">👨‍🏫 PROFESSORES</p>
+                  <div className="space-y-2">
+                    {/* Se temos dados de onlineUsers, usar esses */}
+                    {onlineUsers.coaches.length > 0 ? (
+                      onlineUsers.coaches
+                        .filter(u => u.userType === 'PROFESSOR')
+                        .map(user => (
+                          <div 
+                            key={user.sessionId}
+                            className="flex items-center gap-2 p-2 bg-white/5 rounded-lg"
+                          >
+                            <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold ${
+                              user.status === 'PAUSED' ? 'bg-yellow-500/30 text-yellow-400' :
+                              user.currentQueueId ? 'bg-blue-500 text-white' : 'bg-green-500 text-white'
+                            }`}>
+                              {user.name.split(' ').map(n => n[0]).slice(0, 2).join('')}
+                            </div>
+                            <div className="flex-1 min-w-0">
+                              <p className="text-sm font-medium truncate">{user.name}</p>
+                              <p className="text-xs text-white/40">
+                                {user.status === 'PAUSED' ? `⏸️ ${user.pauseReason || 'Pausado'}` :
+                                 user.currentQueueId ? '🔵 Atendendo' : '🟢 Livre'}
+                              </p>
+                            </div>
+                          </div>
+                        ))
+                    ) : (
+                      /* Fallback: usar activeCoaches */
+                      activeCoaches.map(c => (
+                        <div 
+                          key={c.coachId}
+                          className="flex items-center gap-2 p-2 bg-white/5 rounded-lg"
+                        >
+                          <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold ${
+                            c.status === 'PAUSED' ? 'bg-yellow-500/30 text-yellow-400' :
+                            c.currentQueueId ? 'bg-blue-500 text-white' : 'bg-green-500 text-white'
+                          }`}>
+                            {c.coachName.split(' ').map(n => n[0]).slice(0, 2).join('')}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm font-medium truncate">{c.coachName}</p>
+                            <p className="text-xs text-white/40">
+                              {c.status === 'PAUSED' ? `⏸️ ${c.pauseReason || 'Pausado'}` :
+                               c.currentQueueId ? '🔵 Atendendo' : '🟢 Livre'}
+                            </p>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              )}
+              
+              {/* SUPERVISORES */}
+              {onlineUsers.coaches.filter(u => u.userType === 'SUPERVISOR').length > 0 && (
+                <div className="p-3 border-b border-white/5">
+                  <p className="text-xs text-white/40 font-bold mb-2">👔 SUPERVISORES</p>
+                  <div className="space-y-2">
+                    {onlineUsers.coaches
+                      .filter(u => u.userType === 'SUPERVISOR')
+                      .map(user => (
+                        <div 
+                          key={user.sessionId}
+                          className="flex items-center gap-2 p-2 bg-purple-500/10 rounded-lg border border-purple-500/20"
+                        >
+                          <div className="w-8 h-8 rounded-full bg-purple-500 flex items-center justify-center text-xs font-bold text-white">
+                            {user.name.split(' ').map(n => n[0]).slice(0, 2).join('')}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm font-medium truncate text-purple-300">{user.name}</p>
+                            <p className="text-xs text-purple-400/60">Supervisor</p>
+                          </div>
+                        </div>
+                      ))}
+                  </div>
+                </div>
+              )}
+              
+              {/* ADMINS */}
+              {(onlineUsers.coaches.filter(u => u.userType === 'ADMIN').length > 0) && (
+                <div className="p-3 border-b border-white/5">
+                  <p className="text-xs text-white/40 font-bold mb-2">⭐ ADMINISTRADORES</p>
+                  <div className="space-y-2">
+                    {onlineUsers.coaches
+                      .filter(u => u.userType === 'ADMIN')
+                      .map(user => (
+                        <div 
+                          key={user.sessionId}
+                          className="flex items-center gap-2 p-2 bg-amber-500/10 rounded-lg border border-amber-500/20"
+                        >
+                          <div className="w-8 h-8 rounded-full bg-amber-500 flex items-center justify-center text-xs font-bold text-white">
+                            {user.name.split(' ').map(n => n[0]).slice(0, 2).join('')}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm font-medium truncate text-amber-300">{user.name}</p>
+                            <p className="text-xs text-amber-400/60">Admin</p>
+                          </div>
+                        </div>
+                      ))}
+                  </div>
+                </div>
+              )}
+              
+              {/* CONSULTORAS */}
+              {onlineUsers.consultoras.length > 0 && (
+                <div className="p-3">
+                  <p className="text-xs text-white/40 font-bold mb-2">💼 CONSULTORAS</p>
+                  <div className="space-y-2">
+                    {onlineUsers.consultoras.map(user => (
+                      <div 
+                        key={user.sessionId}
+                        className="flex items-center gap-2 p-2 bg-pink-500/10 rounded-lg border border-pink-500/20"
+                      >
+                        <div className="w-8 h-8 rounded-full bg-pink-500 flex items-center justify-center text-xs font-bold text-white">
+                          {user.name.split(' ').map(n => n[0]).slice(0, 2).join('')}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium truncate text-pink-300">{user.name}</p>
+                          <p className="text-xs text-pink-400/60">Consultora</p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              
+              {/* NENHUM USUÁRIO */}
+              {(onlineUsers.coaches.length === 0 && activeCoaches.length === 0) && (
+                <div className="p-6 text-center text-white/40">
+                  <p className="text-2xl mb-2">😴</p>
+                  <p className="text-sm">Nenhum usuário online</p>
+                </div>
+              )}
+            </div>
+            
+            <div className="p-3 border-t border-white/10 bg-white/5">
+              <p className="text-xs text-white/40 text-center">
+                Total: {onlineUsers.totalOnline || activeCoaches.length} usuário(s) online
+              </p>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Modal de Entrada Manual */}
       <ManualEntryModal
         isOpen={showManualEntry}
@@ -1603,7 +2095,8 @@ function ExpandedAttendanceCard({
   onFinish, 
   onCancel,
   onContinue,
-  onNotify
+  onNotify,
+  onCardio
 }: { 
   member: QueueMember;
   suggestion: Suggestion;
@@ -1614,6 +2107,7 @@ function ExpandedAttendanceCard({
   onCancel: () => void;
   onContinue: () => void;
   onNotify: () => void;
+  onCardio: () => void;
 }) {
   const p = PRIORITY_CONFIG[member.priority] || PRIORITY_CONFIG.YELLOW;
   
@@ -1938,6 +2432,13 @@ function ExpandedAttendanceCard({
             style={{ backgroundColor: p.color }}
           >
             ✅ Finalizar Atendimento
+          </button>
+          <button
+            onClick={onCardio}
+            className="px-5 py-4 rounded-xl font-bold bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-400 flex items-center justify-center gap-2"
+            title="Enviar para Cardio"
+          >
+            🏃 Cardio
           </button>
           <button
             onClick={onNotify}
@@ -2601,6 +3102,173 @@ const MemberCard = forwardRef<HTMLDivElement, {
 MemberCard.displayName = 'MemberCard';
 
 // ============================================================================
+// CARDIO MEMBER CARD - Card para alunos executando cardio
+// ============================================================================
+
+function CardioMemberCard({ 
+  member, 
+  onFinishEarly 
+}: { 
+  member: CardioMember;
+  onFinishEarly: () => void;
+}) {
+  const [timeRemaining, setTimeRemaining] = useState(0);
+  const p = PRIORITY_CONFIG[member.priority] || PRIORITY_CONFIG.YELLOW;
+  
+  // Calcular tempo restante
+  useEffect(() => {
+    const updateTimer = () => {
+      const startedAt = new Date(member.cardioStartedAt).getTime();
+      const durationMs = member.cardioDurationMinutes * 60 * 1000;
+      const endTime = startedAt + durationMs;
+      const remaining = Math.max(0, Math.floor((endTime - Date.now()) / 1000));
+      setTimeRemaining(remaining);
+    };
+    
+    updateTimer();
+    const interval = setInterval(updateTimer, 1000);
+    return () => clearInterval(interval);
+  }, [member.cardioStartedAt, member.cardioDurationMinutes]);
+  
+  // Formatar tempo
+  const minutes = Math.floor(timeRemaining / 60);
+  const seconds = timeRemaining % 60;
+  const timerFormatted = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  
+  // Progresso
+  const totalSeconds = member.cardioDurationMinutes * 60;
+  const elapsed = totalSeconds - timeRemaining;
+  const progress = Math.min(100, (elapsed / totalSeconds) * 100);
+  
+  // Cor baseada no tempo restante
+  const timerColor = timeRemaining < 60 ? '#FF3B30' : timeRemaining < 180 ? '#FF9500' : '#30D158';
+  
+  return (
+    <motion.div
+      layout
+      initial={{ opacity: 0, scale: 0.9 }}
+      animate={{ opacity: 1, scale: 1 }}
+      exit={{ opacity: 0, scale: 0.9 }}
+      className="relative flex overflow-hidden"
+      style={{ 
+        background: 'linear-gradient(145deg, #0a1628 0%, #0d1117 100%)',
+        borderRadius: '12px',
+        border: '2px solid #06b6d4',
+        boxShadow: '0 0 20px rgba(6, 182, 212, 0.3)',
+        minHeight: '160px',
+      }}
+    >
+      {/* BARRA LATERAL ANIMADA */}
+      <div className="relative flex flex-col" style={{ width: '6px', flexShrink: 0 }}>
+        <div 
+          className="absolute left-0 top-0 w-full bg-cyan-500/30"
+          style={{ height: '100%' }}
+        />
+        <motion.div 
+          className="absolute left-0 bottom-0 w-full bg-cyan-400"
+          initial={{ height: '0%' }}
+          animate={{ height: `${progress}%` }}
+          transition={{ duration: 0.5 }}
+        />
+      </div>
+      
+      {/* CONTEÚDO */}
+      <div className="flex-1 p-4">
+        {/* HEADER */}
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-3">
+            {/* Avatar */}
+            <div 
+              className="relative flex items-center justify-center font-bold text-white overflow-hidden"
+              style={{
+                width: '44px',
+                height: '44px',
+                borderRadius: '10px',
+                background: `linear-gradient(135deg, ${p.color} 0%, ${p.color}cc 100%)`,
+                fontSize: '13px',
+              }}
+            >
+              {member.photoUrl ? (
+                <img 
+                  src={member.photoUrl} 
+                  alt={member.memberName}
+                  className="w-full h-full object-cover"
+                />
+              ) : (
+                member.memberName.split(' ').map(n => n[0]).slice(0, 2).join('')
+              )}
+              {/* Badge de cardio */}
+              <div className="absolute -bottom-1 -right-1 w-5 h-5 bg-cyan-500 rounded-full flex items-center justify-center text-[10px] border-2 border-black">
+                🏃
+              </div>
+            </div>
+            
+            <div className="flex-1 min-w-0">
+              <span 
+                className="font-bold text-white block truncate"
+                style={{ fontSize: '13px' }}
+              >
+                {member.memberName.toUpperCase()}
+              </span>
+              <span className="text-xs text-cyan-400/70">
+                {member.cardioDurationMinutes} min de cardio
+              </span>
+            </div>
+          </div>
+          
+          {/* TIMER GRANDE */}
+          <div className="text-right">
+            <div 
+              className="font-mono font-bold text-2xl"
+              style={{ color: timerColor }}
+            >
+              {timerFormatted}
+            </div>
+            <div className="text-[10px] text-white/40 uppercase">Restante</div>
+          </div>
+        </div>
+        
+        {/* BARRA DE PROGRESSO */}
+        <div className="h-2 bg-white/10 rounded-full overflow-hidden mb-3">
+          <motion.div 
+            className="h-full bg-gradient-to-r from-cyan-500 to-cyan-400"
+            initial={{ width: '0%' }}
+            animate={{ width: `${progress}%` }}
+            transition={{ duration: 0.5 }}
+          />
+        </div>
+        
+        {/* INFO E BOTÕES */}
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span 
+              className={`text-xs px-2 py-1 rounded-lg ${
+                member.cardioDestination === 'QUEUE' 
+                  ? 'bg-blue-500/20 text-blue-400' 
+                  : 'bg-green-500/20 text-green-400'
+              }`}
+            >
+              {member.cardioDestination === 'QUEUE' ? '🔄 Volta pra fila' : '✅ Finaliza'}
+            </span>
+            <span className="text-xs text-white/30">
+              • {member.cardioStartedByCoachName}
+            </span>
+          </div>
+          
+          <button
+            onClick={onFinishEarly}
+            className="px-3 py-1.5 bg-white/10 hover:bg-red-500/20 text-white/60 hover:text-red-400 rounded-lg text-xs font-medium transition-all"
+            title="Finalizar cardio agora"
+          >
+            ⏹️ Encerrar
+          </button>
+        </div>
+      </div>
+    </motion.div>
+  );
+}
+
+// ============================================================================
 // FINISHED MEMBER CARD - Card para alunos que já saíram (escurecido)
 // ============================================================================
 
@@ -2969,8 +3637,17 @@ function MemberDetailsModal({
 }) {
   const p = PRIORITY_CONFIG[member.priority] || PRIORITY_CONFIG.YELLOW;
   const timeInGym = calcTimeInGym(member.checkInTime);
-  const retentionScore = member.retentionScore ?? 0; // Sem dados = 0%, não 50%!
+  const retentionScore = member.retentionScore ?? 0;
   const isLowRetention = retentionScore < 50;
+  
+  // Estado para modal de treinos
+  const [showWorkoutsModal, setShowWorkoutsModal] = useState(false);
+  const [workouts, setWorkouts] = useState<any[]>([]);
+  const [loadingWorkouts, setLoadingWorkouts] = useState(false);
+  const [workoutError, setWorkoutError] = useState<string | null>(null);
+  const [workoutsLoaded, setWorkoutsLoaded] = useState(false);
+  const [expandedWorkout, setExpandedWorkout] = useState<number | null>(null);
+  const [expandedSeries, setExpandedSeries] = useState<number | null>(null);
 
   const getTankColor = () => {
     if (retentionScore >= 75) return '#30D158';
@@ -2979,232 +3656,675 @@ function MemberDetailsModal({
     return '#FF3B30';
   };
 
+  // Carregar treinos quando abrir modal de treinos
+  const handleOpenWorkouts = async () => {
+    setShowWorkoutsModal(true);
+    
+    if (workoutsLoaded) return; // Já carregou
+    
+    if (!member.evoMemberId) {
+      setWorkoutError('SEM_EVO_ID');
+      return;
+    }
+    
+    setLoadingWorkouts(true);
+    setWorkoutError(null);
+    
+    try {
+      console.log('[Workouts] Buscando treinos para cliente:', member.evoMemberId);
+      const res = await fetch(`/api/evo/workouts?idClient=${member.evoMemberId}`);
+      const data = await res.json();
+      
+      console.log('[Workouts] Resposta:', data);
+      
+      if (data.success) {
+        setWorkouts(data.workouts || []);
+        setWorkoutsLoaded(true);
+        if (!data.workouts || data.workouts.length === 0) {
+          setWorkoutError('SEM_FICHA');
+        }
+      } else {
+        setWorkoutError(data.error || 'Erro ao carregar treinos');
+      }
+    } catch (err) {
+      console.error('Erro ao carregar treinos:', err);
+      setWorkoutError('Erro de conexão com o servidor');
+    } finally {
+      setLoadingWorkouts(false);
+    }
+  };
+
+  // Formatar data
+  const formatDate = (dateStr: string) => {
+    if (!dateStr) return '-';
+    try {
+      return new Date(dateStr).toLocaleDateString('pt-BR');
+    } catch {
+      return dateStr;
+    }
+  };
+
+  // Verificar se treino está vencido
+  const isWorkoutExpired = (workout: any) => {
+    if (!workout.dataValidade) return false;
+    return new Date() > new Date(workout.dataValidade);
+  };
+
+  // Separar treinos válidos e vencidos
+  const validWorkouts = workouts.filter(w => !isWorkoutExpired(w) && !w.flExcluido);
+  const expiredWorkouts = workouts.filter(w => isWorkoutExpired(w) && !w.flExcluido);
+  const hasOnlyExpired = validWorkouts.length === 0 && expiredWorkouts.length > 0;
+
+  // Status do treino
+  const getWorkoutStatus = (workout: any) => {
+    if (workout.flExcluido) return { label: 'Excluído', color: '#8E8E93' };
+    if (isWorkoutExpired(workout)) return { label: 'Vencido', color: '#FF3B30' };
+    if (workout.statusTreino === 2) return { label: 'Concluído', color: '#007AFF' };
+    if (workout.sessoesConcluidas > 0) return { label: 'Em andamento', color: '#30D158' };
+    return { label: 'Ativo', color: '#30D158' };
+  };
+
   return (
-    <motion.div 
-      initial={{ opacity: 0 }} 
-      animate={{ opacity: 1 }} 
-      exit={{ opacity: 0 }} 
-      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80" 
-      onClick={onClose}
-    >
+    <>
+      {/* MODAL PRINCIPAL - DESIGN ORIGINAL */}
       <motion.div 
-        initial={{ scale: 0.95 }} 
-        animate={{ scale: 1 }} 
-        exit={{ scale: 0.95 }} 
-        className="w-full max-w-lg bg-[#1a1a1a] rounded-2xl border border-white/10 max-h-[90vh] overflow-y-auto" 
-        onClick={e => e.stopPropagation()}
+        initial={{ opacity: 0 }} 
+        animate={{ opacity: 1 }} 
+        exit={{ opacity: 0 }} 
+        className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80" 
+        onClick={onClose}
       >
-        {/* Header com Foto em Destaque */}
-        <div 
-          className="relative border-b border-white/5"
-          style={{ background: `linear-gradient(135deg, ${p.color}20 0%, transparent 100%)` }}
+        <motion.div 
+          initial={{ scale: 0.95 }} 
+          animate={{ scale: 1 }} 
+          exit={{ scale: 0.95 }} 
+          className="w-full max-w-lg bg-[#1a1a1a] rounded-2xl border border-white/10 max-h-[90vh] overflow-y-auto" 
+          onClick={e => e.stopPropagation()}
         >
-          {/* Botão fechar */}
-          <button 
-            onClick={onClose} 
-            className="absolute top-3 right-3 p-2 hover:bg-white/10 rounded-full z-10 bg-black/30"
+          {/* Header com Foto em Destaque - DESIGN ORIGINAL */}
+          <div 
+            className="relative border-b border-white/5"
+            style={{ background: `linear-gradient(135deg, ${p.color}20 0%, transparent 100%)` }}
           >
-            ✕
-          </button>
-          
-          {/* Foto Grande em Destaque */}
-          <div className="flex flex-col items-center pt-6 pb-4">
-            {/* Foto ou Iniciais */}
-            <div 
-              className="rounded-2xl flex items-center justify-center text-5xl font-bold text-white overflow-hidden mb-4"
-              style={{ 
-                width: '180px',
-                height: '180px',
-                background: `linear-gradient(135deg, ${p.color} 0%, ${p.color}cc 100%)`,
-                border: isLowRetention ? '4px solid #FF3B30' : `3px solid ${p.color}`,
-                boxShadow: isLowRetention 
-                  ? '0 10px 40px rgba(255,59,48,0.5)'
-                  : `0 10px 40px ${p.color}40`,
-              }}
+            {/* Botão fechar */}
+            <button 
+              onClick={onClose} 
+              className="absolute top-3 right-3 p-2 hover:bg-white/10 rounded-full z-10 bg-black/30"
             >
-              {member.photoUrl ? (
-                <img 
-                  src={member.photoUrl} 
-                  alt={member.name}
-                  className="w-full h-full object-cover"
-                  style={{ 
-                    imageRendering: 'auto',
-                    filter: 'contrast(1.02)',
-                  }}
-                  onError={(e) => {
-                    e.currentTarget.style.display = 'none';
-                    e.currentTarget.parentElement!.innerHTML = member.name.split(' ').map(n => n[0]).slice(0, 2).join('');
-                  }}
-                />
-              ) : (
-                member.name.split(' ').map(n => n[0]).slice(0, 2).join('')
+              ✕
+            </button>
+            
+            {/* Foto Grande em Destaque */}
+            <div className="flex flex-col items-center pt-6 pb-4">
+              <div 
+                className="rounded-2xl flex items-center justify-center text-5xl font-bold text-white overflow-hidden mb-4"
+                style={{ 
+                  width: '180px',
+                  height: '180px',
+                  background: `linear-gradient(135deg, ${p.color} 0%, ${p.color}cc 100%)`,
+                  border: isLowRetention ? '4px solid #FF3B30' : `3px solid ${p.color}`,
+                  boxShadow: isLowRetention 
+                    ? '0 10px 40px rgba(255,59,48,0.5)'
+                    : `0 10px 40px ${p.color}40`,
+                }}
+              >
+                {member.photoUrl ? (
+                  <img 
+                    src={member.photoUrl} 
+                    alt={member.name}
+                    className="w-full h-full object-cover"
+                    style={{ imageRendering: 'auto', filter: 'contrast(1.02)' }}
+                    onError={(e) => {
+                      e.currentTarget.style.display = 'none';
+                      e.currentTarget.parentElement!.innerHTML = member.name.split(' ').map(n => n[0]).slice(0, 2).join('');
+                    }}
+                  />
+                ) : (
+                  member.name.split(' ').map(n => n[0]).slice(0, 2).join('')
+                )}
+              </div>
+              
+              <h2 className="text-xl font-bold text-center px-4">{member.name}</h2>
+              
+              <div className="flex items-center gap-3 text-sm text-white/60 mt-1">
+                <span>🏋️ {timeInGym} na academia</span>
+                <span>📅 {member.daysAsMember} dias</span>
+              </div>
+              
+              {isLowRetention && (
+                <div className="mt-2 px-3 py-1 rounded-full bg-red-500/20 text-red-400 text-xs font-bold">
+                  ⚠️ RISCO DE DESISTÊNCIA
+                </div>
               )}
             </div>
             
-            {/* Nome */}
-            <h2 className="text-xl font-bold text-center px-4">{member.name}</h2>
-            
-            {/* Info básica */}
-            <div className="flex items-center gap-3 text-sm text-white/60 mt-1">
-              <span>🏋️ {timeInGym} na academia</span>
-              <span>📅 {member.daysAsMember} dias</span>
+            {/* Tanque de Retenção */}
+            <div className="absolute top-3 left-3 flex flex-col items-center">
+              <div 
+                className="w-10 h-16 bg-black/50 rounded-lg flex flex-col justify-end overflow-hidden"
+                style={{ border: `2px solid ${getTankColor()}40` }}
+              >
+                <div 
+                  style={{ 
+                    height: `${retentionScore}%`, 
+                    background: `linear-gradient(0deg, ${getTankColor()} 0%, ${getTankColor()}99 100%)`,
+                    borderRadius: '0 0 4px 4px',
+                  }} 
+                />
+              </div>
+              <span className="text-xs font-bold mt-1" style={{ color: getTankColor() }}>{retentionScore}%</span>
             </div>
-            
-            {isLowRetention && (
-              <div className="mt-2 px-3 py-1 rounded-full bg-red-500/20 text-red-400 text-xs font-bold">
-                ⚠️ RISCO DE DESISTÊNCIA
+          </div>
+
+          {/* Informações detalhadas */}
+          <div className="p-4 space-y-4">
+            {/* Stats */}
+            <div className="grid grid-cols-3 gap-3">
+              <div className="bg-white/5 rounded-xl p-3 text-center">
+                <p className="text-white/40 text-xs mb-1">Prioridade</p>
+                <p className="font-bold text-lg" style={{ color: p.color }}>{p.label}</p>
+              </div>
+              <div className="bg-white/5 rounded-xl p-3 text-center">
+                <p className="text-white/40 text-xs mb-1">Fase</p>
+                <p className="font-bold text-lg">{getPhaseLabel(member.daysAsMember)}</p>
+              </div>
+              <div className="bg-white/5 rounded-xl p-3 text-center">
+                <p className="text-white/40 text-xs mb-1">Treino</p>
+                <p className="font-bold text-lg">{member.workoutLetter || '-'}</p>
+              </div>
+            </div>
+
+            {/* Ficha e Avaliação */}
+            <div className="grid grid-cols-2 gap-3">
+              <div 
+                className="rounded-xl p-3"
+                style={{ 
+                  background: member.hasFicha && !member.fichaVencida ? 'rgba(48, 209, 88, 0.1)' : 'rgba(255, 59, 48, 0.1)',
+                  border: `1px solid ${member.hasFicha && !member.fichaVencida ? 'rgba(48, 209, 88, 0.3)' : 'rgba(255, 59, 48, 0.3)'}`,
+                }}
+              >
+                <p className="text-white/40 text-xs mb-1">📋 Ficha de Treino</p>
+                <p className="font-bold" style={{ color: member.hasFicha && !member.fichaVencida ? '#30D158' : '#FF3B30' }}>
+                  {!member.hasFicha ? '❌ SEM FICHA' : member.fichaVencida ? '⚠️ VENCIDA' : '✓ OK'}
+                </p>
+                {member.workoutName && <p className="text-xs text-white/50 mt-1">{member.workoutName}</p>}
+              </div>
+              <div 
+                className="rounded-xl p-3"
+                style={{ 
+                  background: member.hasAvaliacao && !member.avaliacaoVencida ? 'rgba(48, 209, 88, 0.1)' : 'rgba(255, 59, 48, 0.1)',
+                  border: `1px solid ${member.hasAvaliacao && !member.avaliacaoVencida ? 'rgba(48, 209, 88, 0.3)' : 'rgba(255, 59, 48, 0.3)'}`,
+                }}
+              >
+                <p className="text-white/40 text-xs mb-1">📊 Avaliação Física</p>
+                <p className="font-bold" style={{ color: member.hasAvaliacao && !member.avaliacaoVencida ? '#30D158' : '#FF3B30' }}>
+                  {!member.hasAvaliacao ? '❌ SEM AVAL.' : member.avaliacaoVencida ? '⚠️ VENCIDA' : '✓ OK'}
+                </p>
+              </div>
+            </div>
+
+            {/* Frequência */}
+            <div className="bg-white/5 rounded-xl p-3">
+              <p className="text-white/40 text-xs mb-2">📈 Frequência Semanal (esperado: {member.freqEsperada || 5}x)</p>
+              <div className="grid grid-cols-3 gap-2 text-center">
+                <div>
+                  <p className="text-2xl font-bold text-white/50">{member.freq15_21 || 0}x</p>
+                  <p className="text-[10px] text-white/40">2 sem atrás</p>
+                </div>
+                <div>
+                  <p className={`text-2xl font-bold ${(member.freq08_14 || 0) < (member.freq15_21 || 0) ? 'text-orange-400' : 'text-white/60'}`}>
+                    {member.freq08_14 || 0}x
+                  </p>
+                  <p className="text-[10px] text-white/40">Sem passada</p>
+                </div>
+                <div>
+                  <p className={`text-2xl font-bold ${
+                    (member.freqAtual || 0) >= (member.freqEsperada || 5) ? 'text-green-400' : 
+                    (member.freqAtual || 0) > 0 ? 'text-blue-400' : 'text-white/30'
+                  }`}>
+                    {member.freqAtual || 0}x
+                  </p>
+                  <p className="text-[10px] text-white/40">Esta semana</p>
+                </div>
+              </div>
+            </div>
+
+            {/* Tags */}
+            {member.tags && member.tags.length > 0 && (
+              <div className="flex flex-wrap gap-2">
+                {member.tags.map((tag, i) => (
+                  <span 
+                    key={i}
+                    className="px-2 py-1 rounded-full text-xs font-medium"
+                    style={{ 
+                      background: tag.includes('SEM') || tag.includes('VENCID') ? 'rgba(255,59,48,0.2)' : 'rgba(255,255,255,0.1)',
+                      color: tag.includes('SEM') || tag.includes('VENCID') ? '#FF6B6B' : '#fff',
+                    }}
+                  >
+                    {tag}
+                  </span>
+                ))}
               </div>
             )}
           </div>
-          
-          {/* Tanque de Retenção - Posicionado no canto */}
-          <div className="absolute top-3 left-3 flex flex-col items-center">
-            <div 
-              className="w-10 h-16 bg-black/50 rounded-lg flex flex-col justify-end overflow-hidden"
-              style={{ border: `2px solid ${getTankColor()}40` }}
+
+          {/* Ações */}
+          <div className="p-4 border-t border-white/5 space-y-3">
+            {/* Botão Ver Ficha de Treino */}
+            <button
+              onClick={handleOpenWorkouts}
+              className="w-full py-3 rounded-xl font-bold text-cyan-400 bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center gap-2 hover:bg-cyan-500/20 transition-all"
             >
-              <div 
-                style={{ 
-                  height: `${retentionScore}%`, 
-                  background: `linear-gradient(0deg, ${getTankColor()} 0%, ${getTankColor()}99 100%)`,
-                  borderRadius: '0 0 4px 4px',
-                }} 
-              />
-            </div>
-            <span className="text-xs font-bold mt-1" style={{ color: getTankColor() }}>{retentionScore}%</span>
-          </div>
-        </div>
+              🏋️ Ver Ficha de Treino Completa
+            </button>
 
-        {/* Informações detalhadas */}
-        <div className="p-4 space-y-4">
-          {/* Stats */}
-          <div className="grid grid-cols-3 gap-3">
-            <div className="bg-white/5 rounded-xl p-3 text-center">
-              <p className="text-white/40 text-xs mb-1">Prioridade</p>
-              <p className="font-bold text-lg" style={{ color: p.color }}>{p.label}</p>
-            </div>
-            <div className="bg-white/5 rounded-xl p-3 text-center">
-              <p className="text-white/40 text-xs mb-1">Fase</p>
-              <p className="font-bold text-lg">{getPhaseLabel(member.daysAsMember)}</p>
-            </div>
-            <div className="bg-white/5 rounded-xl p-3 text-center">
-              <p className="text-white/40 text-xs mb-1">Treino</p>
-              <p className="font-bold text-lg">{member.workoutLetter || '-'}</p>
-            </div>
-          </div>
-
-          {/* Ficha e Avaliação */}
-          <div className="grid grid-cols-2 gap-3">
-            <div 
-              className="rounded-xl p-3"
+            {/* Botão principal - Iniciar Atendimento */}
+            <button
+              onClick={onAttend}
+              className="w-full py-3 rounded-xl font-bold text-white flex items-center justify-center gap-2"
               style={{ 
-                background: member.hasFicha && !member.fichaVencida ? 'rgba(48, 209, 88, 0.1)' : 'rgba(255, 59, 48, 0.1)',
-                border: `1px solid ${member.hasFicha && !member.fichaVencida ? 'rgba(48, 209, 88, 0.3)' : 'rgba(255, 59, 48, 0.3)'}`,
+                background: `linear-gradient(135deg, ${p.color} 0%, ${p.color}cc 100%)`,
+                boxShadow: `0 4px 15px ${p.color}40`,
               }}
             >
-              <p className="text-white/40 text-xs mb-1">📋 Ficha de Treino</p>
-              <p className="font-bold" style={{ color: member.hasFicha && !member.fichaVencida ? '#30D158' : '#FF3B30' }}>
-                {!member.hasFicha ? '❌ SEM FICHA' : member.fichaVencida ? '⚠️ VENCIDA' : '✓ OK'}
-              </p>
-              {member.workoutName && <p className="text-xs text-white/50 mt-1">{member.workoutName}</p>}
-            </div>
-            <div 
-              className="rounded-xl p-3"
-              style={{ 
-                background: member.hasAvaliacao && !member.avaliacaoVencida ? 'rgba(48, 209, 88, 0.1)' : 'rgba(255, 59, 48, 0.1)',
-                border: `1px solid ${member.hasAvaliacao && !member.avaliacaoVencida ? 'rgba(48, 209, 88, 0.3)' : 'rgba(255, 59, 48, 0.3)'}`,
-              }}
-            >
-              <p className="text-white/40 text-xs mb-1">📊 Avaliação Física</p>
-              <p className="font-bold" style={{ color: member.hasAvaliacao && !member.avaliacaoVencida ? '#30D158' : '#FF3B30' }}>
-                {!member.hasAvaliacao ? '❌ SEM AVAL.' : member.avaliacaoVencida ? '⚠️ VENCIDA' : '✓ OK'}
-              </p>
-            </div>
-          </div>
-
-          {/* Frequência */}
-          <div className="bg-white/5 rounded-xl p-3">
-            <p className="text-white/40 text-xs mb-2">📈 Frequência Semanal (esperado: {member.freqEsperada || 5}x)</p>
-            <div className="grid grid-cols-3 gap-2 text-center">
-              <div>
-                <p className="text-2xl font-bold text-white/50">{member.freq15_21 || 0}x</p>
-                <p className="text-[10px] text-white/40">2 sem atrás</p>
-              </div>
-              <div>
-                <p className={`text-2xl font-bold ${(member.freq08_14 || 0) < (member.freq15_21 || 0) ? 'text-orange-400' : 'text-white/60'}`}>
-                  {member.freq08_14 || 0}x
-                </p>
-                <p className="text-[10px] text-white/40">Sem passada</p>
-              </div>
-              <div>
-                <p className={`text-2xl font-bold ${
-                  (member.freqAtual || 0) >= (member.freqEsperada || 5) ? 'text-green-400' : 
-                  (member.freqAtual || 0) > 0 ? 'text-blue-400' : 'text-white/30'
-                }`}>
-                  {member.freqAtual || 0}x
-                </p>
-                <p className="text-[10px] text-white/40">Esta semana</p>
-              </div>
-            </div>
-          </div>
-
-          {/* Tags */}
-          {member.tags && member.tags.length > 0 && (
-            <div className="flex flex-wrap gap-2">
-              {member.tags.map((tag, i) => (
-                <span 
-                  key={i}
-                  className="px-2 py-1 rounded-full text-xs font-medium"
-                  style={{ 
-                    background: tag.includes('SEM') || tag.includes('VENCID') ? 'rgba(255,59,48,0.2)' : 'rgba(255,255,255,0.1)',
-                    color: tag.includes('SEM') || tag.includes('VENCID') ? '#FF6B6B' : '#fff',
-                  }}
-                >
-                  {tag}
-                </span>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* Ações */}
-        <div className="p-4 border-t border-white/5 space-y-3">
-          {/* Botão principal - Iniciar Atendimento */}
-          <button
-            onClick={onAttend}
-            className="w-full py-3 rounded-xl font-bold text-white flex items-center justify-center gap-2"
-            style={{ 
-              background: `linear-gradient(135deg, ${p.color} 0%, ${p.color}cc 100%)`,
-              boxShadow: `0 4px 15px ${p.color}40`,
-            }}
-          >
-            ⚡ INICIAR ATENDIMENTO
-          </button>
-          
-          {/* Ações secundárias */}
-          <div className="grid grid-cols-2 gap-3">
-            <button
-              onClick={onNotify}
-              className="py-2.5 rounded-xl font-medium text-purple-400 bg-purple-500/10 border border-purple-500/30 flex items-center justify-center gap-2 hover:bg-purple-500/20 transition-all"
-            >
-              📢 Notificar
+              ⚡ INICIAR ATENDIMENTO
             </button>
-            <button
-              onClick={onCheckout}
-              className="py-2.5 rounded-xl font-medium text-yellow-400 bg-yellow-500/10 border border-yellow-500/30 flex items-center justify-center gap-2 hover:bg-yellow-500/20 transition-all"
-            >
-              👋 Checkout
-            </button>
+            
+            {/* Ações secundárias */}
+            <div className="grid grid-cols-2 gap-3">
+              <button
+                onClick={onNotify}
+                className="py-2.5 rounded-xl font-medium text-purple-400 bg-purple-500/10 border border-purple-500/30 flex items-center justify-center gap-2 hover:bg-purple-500/20 transition-all"
+              >
+                📢 Notificar
+              </button>
+              <button
+                onClick={onCheckout}
+                className="py-2.5 rounded-xl font-medium text-yellow-400 bg-yellow-500/10 border border-yellow-500/30 flex items-center justify-center gap-2 hover:bg-yellow-500/20 transition-all"
+              >
+                👋 Checkout
+              </button>
+            </div>
           </div>
-        </div>
+        </motion.div>
       </motion.div>
-    </motion.div>
+
+      {/* MODAL DE FICHAS DE TREINO */}
+      {showWorkoutsModal && (
+        <motion.div 
+          initial={{ opacity: 0 }} 
+          animate={{ opacity: 1 }} 
+          exit={{ opacity: 0 }} 
+          className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/90" 
+          onClick={() => setShowWorkoutsModal(false)}
+        >
+          <motion.div 
+            initial={{ scale: 0.95, y: 20 }} 
+            animate={{ scale: 1, y: 0 }} 
+            exit={{ scale: 0.95, y: 20 }} 
+            className="w-full max-w-2xl bg-[#1a1a1a] rounded-2xl border border-cyan-500/30 max-h-[90vh] overflow-hidden flex flex-col" 
+            onClick={e => e.stopPropagation()}
+          >
+            {/* Header */}
+            <div className="p-4 border-b border-white/10 flex items-center justify-between bg-cyan-500/10 shrink-0">
+              <div className="flex items-center gap-3">
+                <span className="text-2xl">🏋️</span>
+                <div>
+                  <h3 className="font-bold text-cyan-400">Fichas de Treino</h3>
+                  <p className="text-xs text-white/50">{member.name}</p>
+                </div>
+              </div>
+              <button 
+                onClick={() => setShowWorkoutsModal(false)} 
+                className="p-2 hover:bg-white/10 rounded-lg transition-colors"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Conteúdo */}
+            <div className="flex-1 overflow-y-auto p-4">
+              {/* Loading */}
+              {loadingWorkouts && (
+                <div className="flex flex-col items-center justify-center py-16">
+                  <div className="w-12 h-12 border-3 border-cyan-500 border-t-transparent rounded-full animate-spin mb-4" />
+                  <p className="text-white/60">Carregando fichas de treino...</p>
+                </div>
+              )}
+
+              {/* ERRO: Sem ID EVO */}
+              {!loadingWorkouts && workoutError === 'SEM_EVO_ID' && (
+                <div className="text-center py-12">
+                  <div className="w-20 h-20 rounded-full bg-yellow-500/20 flex items-center justify-center mx-auto mb-4">
+                    <span className="text-4xl">⚠️</span>
+                  </div>
+                  <p className="text-yellow-400 font-bold text-lg mb-2">Aluno sem vínculo no EVO</p>
+                  <p className="text-white/50 text-sm mb-6">Não é possível buscar a ficha de treino deste aluno.</p>
+                  <button
+                    onClick={() => { setShowWorkoutsModal(false); onNotify(); }}
+                    className="px-6 py-3 bg-purple-500/20 text-purple-400 rounded-xl font-bold hover:bg-purple-500/30 transition-all border border-purple-500/30"
+                  >
+                    📢 Notificar Supervisor
+                  </button>
+                </div>
+              )}
+
+              {/* ERRO: Sem ficha */}
+              {!loadingWorkouts && workoutError === 'SEM_FICHA' && (
+                <div className="text-center py-12">
+                  <div className="w-20 h-20 rounded-full bg-red-500/20 flex items-center justify-center mx-auto mb-4">
+                    <span className="text-4xl">📋</span>
+                  </div>
+                  <p className="text-red-400 font-bold text-xl mb-2">ALUNO SEM FICHA</p>
+                  <p className="text-white/50 text-sm mb-6">
+                    Este aluno não possui treino cadastrado no sistema.<br/>
+                    Insira um treino válido ou notifique o supervisor.
+                  </p>
+                  <button
+                    onClick={() => { setShowWorkoutsModal(false); onNotify(); }}
+                    className="px-6 py-3 bg-purple-500/20 text-purple-400 rounded-xl font-bold hover:bg-purple-500/30 transition-all border border-purple-500/30"
+                  >
+                    📢 Notificar Supervisor para Criar Treino
+                  </button>
+                </div>
+              )}
+
+              {/* ERRO: Outro erro */}
+              {!loadingWorkouts && workoutError && workoutError !== 'SEM_FICHA' && workoutError !== 'SEM_EVO_ID' && (
+                <div className="text-center py-12">
+                  <div className="w-20 h-20 rounded-full bg-red-500/20 flex items-center justify-center mx-auto mb-4">
+                    <span className="text-4xl">❌</span>
+                  </div>
+                  <p className="text-red-400 font-bold text-lg mb-2">Erro ao carregar</p>
+                  <p className="text-white/50 text-sm mb-6">{workoutError}</p>
+                  <button
+                    onClick={() => { setWorkoutsLoaded(false); setWorkoutError(null); handleOpenWorkouts(); }}
+                    className="px-6 py-3 bg-white/10 text-white rounded-xl font-bold hover:bg-white/20 transition-all"
+                  >
+                    🔄 Tentar novamente
+                  </button>
+                </div>
+              )}
+
+              {/* ALERTA: Só tem fichas vencidas */}
+              {!loadingWorkouts && !workoutError && hasOnlyExpired && (
+                <div className="mb-6 p-5 bg-red-500/10 border-2 border-red-500/30 rounded-xl">
+                  <div className="flex items-start gap-4">
+                    <span className="text-3xl">⚠️</span>
+                    <div className="flex-1">
+                      <p className="text-red-400 font-bold text-lg">FICHA VENCIDA!</p>
+                      <p className="text-white/60 text-sm mt-1">
+                        Todas as fichas deste aluno estão vencidas. É necessário renovar o treino.
+                      </p>
+                      <button
+                        onClick={() => { setShowWorkoutsModal(false); onNotify(); }}
+                        className="mt-4 px-5 py-2.5 bg-orange-500/20 text-orange-400 rounded-xl font-bold text-sm hover:bg-orange-500/30 transition-all flex items-center gap-2 border border-orange-500/30"
+                      >
+                        🔄 Solicitar Renovação de Treino
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* TREINOS VÁLIDOS */}
+              {!loadingWorkouts && !workoutError && validWorkouts.length > 0 && (
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between">
+                    <p className="text-sm text-white/60">
+                      🏋️ <span className="font-bold text-white">{validWorkouts.length}</span> {validWorkouts.length === 1 ? 'Treino Ativo' : 'Treinos Ativos'}
+                    </p>
+                    {validWorkouts.length > 2 && (
+                      <p className="text-xs text-white/40">← Deslize para ver todos →</p>
+                    )}
+                  </div>
+
+                  {/* Cards horizontais */}
+                  <div 
+                    className="flex gap-3 overflow-x-auto pb-2 snap-x snap-mandatory"
+                    style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}
+                  >
+                    {validWorkouts.map((workout, wIdx) => {
+                      const status = getWorkoutStatus(workout);
+                      const isSelected = expandedWorkout === workout.idTreino;
+                      const letters = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
+                      const letter = letters[wIdx] || String(wIdx + 1);
+                      
+                      return (
+                        <button
+                          key={workout.idTreino}
+                          onClick={() => setExpandedWorkout(isSelected ? null : workout.idTreino)}
+                          className={`flex-shrink-0 snap-center rounded-xl p-4 transition-all duration-300 ${
+                            isSelected 
+                              ? 'bg-green-500/20 border-2 border-green-500 scale-105' 
+                              : 'bg-white/5 border border-white/10 hover:bg-white/10'
+                          }`}
+                          style={{ minWidth: '130px' }}
+                        >
+                          <div 
+                            className="w-14 h-14 rounded-xl flex items-center justify-center font-black text-2xl mx-auto mb-2"
+                            style={{ 
+                              background: isSelected ? status.color : `${status.color}30`,
+                              color: isSelected ? '#fff' : status.color,
+                            }}
+                          >
+                            {letter}
+                          </div>
+                          <p className="font-bold text-xs text-center truncate mb-1">
+                            {workout.nomeTreino || `Treino ${letter}`}
+                          </p>
+                          <div 
+                            className="text-[9px] px-2 py-0.5 rounded-full text-center font-medium mx-auto"
+                            style={{ background: `${status.color}20`, color: status.color, width: 'fit-content' }}
+                          >
+                            {status.label}
+                          </div>
+                          {isSelected && <div className="text-green-400 text-center mt-2">▼</div>}
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {/* Detalhes do treino selecionado */}
+                  {expandedWorkout && validWorkouts.find(w => w.idTreino === expandedWorkout) && (
+                    <WorkoutDetailsPanel 
+                      workout={validWorkouts.find(w => w.idTreino === expandedWorkout)!}
+                      formatDate={formatDate}
+                      getWorkoutStatus={getWorkoutStatus}
+                      expandedSeries={expandedSeries}
+                      setExpandedSeries={setExpandedSeries}
+                    />
+                  )}
+
+                  {!expandedWorkout && (
+                    <p className="text-center text-white/40 text-sm py-4">
+                      👆 Toque em um treino para ver os exercícios
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {/* TREINOS VENCIDOS (mostrar abaixo) */}
+              {!loadingWorkouts && !workoutError && expiredWorkouts.length > 0 && validWorkouts.length > 0 && (
+                <div className="mt-6 pt-6 border-t border-white/10">
+                  <p className="text-sm text-white/40 mb-3">📁 Treinos Vencidos ({expiredWorkouts.length})</p>
+                  <div className="space-y-2 opacity-60">
+                    {expiredWorkouts.slice(0, 3).map((workout, wIdx) => {
+                      const letters = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
+                      const letter = letters[wIdx] || String(wIdx + 1);
+                      
+                      return (
+                        <div 
+                          key={workout.idTreino}
+                          className="p-3 bg-white/5 rounded-lg border border-white/10 flex items-center justify-between"
+                        >
+                          <div className="flex items-center gap-3">
+                            <span className="w-8 h-8 rounded-lg bg-red-500/20 text-red-400 flex items-center justify-center font-bold text-sm">
+                              {letter}
+                            </span>
+                            <div>
+                              <p className="font-medium text-sm">{workout.nomeTreino || `Treino ${letter}`}</p>
+                              <p className="text-xs text-red-400">Venceu em {formatDate(workout.dataValidade)}</p>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Footer */}
+            <div className="p-4 border-t border-white/10 shrink-0">
+              <button
+                onClick={() => setShowWorkoutsModal(false)}
+                className="w-full py-3 bg-white/5 hover:bg-white/10 rounded-xl font-medium transition-all"
+              >
+                ← Voltar
+              </button>
+            </div>
+          </motion.div>
+        </motion.div>
+      )}
+    </>
   );
 }
 
-// ============================================================================
-// MODAL DE NOTIFICAÇÃO À COORDENAÇÃO
-// ============================================================================
+// Componente auxiliar para detalhes do treino
+function WorkoutDetailsPanel({ 
+  workout, 
+  formatDate, 
+  getWorkoutStatus,
+  expandedSeries,
+  setExpandedSeries,
+}: { 
+  workout: any;
+  formatDate: (d: string) => string;
+  getWorkoutStatus: (w: any) => { label: string; color: string };
+  expandedSeries: number | null;
+  setExpandedSeries: (id: number | null) => void;
+}) {
+  const status = getWorkoutStatus(workout);
+  const validUntil = workout.dataValidade ? new Date(workout.dataValidade) : null;
+  const daysRemaining = validUntil 
+    ? Math.ceil((validUntil.getTime() - Date.now()) / (1000 * 60 * 60 * 24))
+    : null;
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: -10 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="bg-white/5 rounded-xl border border-green-500/30 overflow-hidden"
+    >
+      {/* Header */}
+      <div className="p-4 flex items-center gap-3" style={{ background: `${status.color}15` }}>
+        <div 
+          className="w-12 h-12 rounded-xl flex items-center justify-center font-black text-xl"
+          style={{ background: status.color, color: '#fff' }}
+        >
+          {workout.nomeTreino?.charAt(0) || 'A'}
+        </div>
+        <div className="flex-1">
+          <p className="font-bold text-lg">{workout.nomeTreino}</p>
+          {workout.nomeProfessor && <p className="text-xs text-white/50">Prof. {workout.nomeProfessor}</p>}
+        </div>
+      </div>
+
+      {/* Info Grid */}
+      <div className="p-4 grid grid-cols-4 gap-3 border-b border-white/5 text-center">
+        <div>
+          <p className="text-white/40 text-[10px]">INÍCIO</p>
+          <p className="font-bold text-sm">{formatDate(workout.dataInicio)}</p>
+        </div>
+        <div>
+          <p className="text-white/40 text-[10px]">VALIDADE</p>
+          <p className="font-bold text-sm" style={{ color: daysRemaining !== null && daysRemaining < 7 ? '#FF3B30' : 'inherit' }}>
+            {formatDate(workout.dataValidade)}
+          </p>
+          {daysRemaining !== null && daysRemaining > 0 && daysRemaining < 15 && (
+            <p className="text-[9px] text-orange-400">{daysRemaining} dias</p>
+          )}
+        </div>
+        <div>
+          <p className="text-white/40 text-[10px]">SESSÕES</p>
+          <p className="font-bold text-sm">{workout.sessoesConcluidas || 0}/{workout.quantidadeSessoes || '-'}</p>
+        </div>
+        <div>
+          <p className="text-white/40 text-[10px]">FREQ.</p>
+          <p className="font-bold text-sm">{workout.frequenciaSemana || workout.quantidadeSemanal || '-'}x</p>
+        </div>
+      </div>
+
+      {/* Observação */}
+      {workout.observacao && (
+        <div className="p-3 bg-blue-500/10 border-b border-white/5">
+          <p className="text-xs text-blue-400">📝 {workout.observacao}</p>
+        </div>
+      )}
+
+      {/* Séries */}
+      {workout.series && workout.series.length > 0 && (
+        <div>
+          <p className="text-[10px] text-white/40 font-bold px-4 py-2 bg-white/5">
+            SÉRIES ({workout.series.length})
+          </p>
+          {workout.series.map((serie: any, sIdx: number) => {
+            const isExpanded = expandedSeries === serie.idSerie;
+            
+            return (
+              <div key={serie.idSerie || sIdx} className="border-t border-white/5">
+                <button
+                  onClick={() => setExpandedSeries(isExpanded ? null : serie.idSerie)}
+                  className="w-full p-3 flex items-center justify-between hover:bg-white/5"
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="w-7 h-7 rounded-lg bg-green-500/20 text-green-400 flex items-center justify-center text-xs font-bold">
+                      {serie.ordem || sIdx + 1}
+                    </span>
+                    <span className="font-medium text-sm">{serie.nome || `Série ${sIdx + 1}`}</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-white/40">{serie.itens?.length || 0} ex.</span>
+                    <span className={`transition-transform text-white/40 ${isExpanded ? 'rotate-180' : ''}`}>▼</span>
+                  </div>
+                </button>
+
+                {isExpanded && serie.itens && (
+                  <div className="bg-black/40 divide-y divide-white/5">
+                    {serie.itens.map((item: any, iIdx: number) => (
+                      <div key={item.idItem || iIdx} className="p-3 pl-12">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="flex-1 min-w-0">
+                            <p className="font-medium text-sm">{item.nomeExercicio || item.nome || `Exercício ${iIdx + 1}`}</p>
+                            {item.grupoMuscular && <p className="text-[10px] text-white/40">{item.grupoMuscular}</p>}
+                          </div>
+                          <div className="text-right">
+                            <p className="font-bold text-green-400">{item.series || '-'} x {item.repeticoes || '-'}</p>
+                            {item.carga && <p className="text-xs text-cyan-400">{item.carga}</p>}
+                          </div>
+                        </div>
+                        {item.observacao && (
+                          <p className="text-[10px] text-white/50 mt-1">💬 {item.observacao}</p>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {(!workout.series || workout.series.length === 0) && (
+        <div className="p-6 text-center text-white/40 text-sm">
+          Nenhuma série cadastrada neste treino
+        </div>
+      )}
+    </motion.div>
+  );
+}
 
 function NotifyCoordinationModal({ 
   member, 

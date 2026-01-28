@@ -279,28 +279,6 @@ const CACHE_TTL = 2 * 60 * 1000; // 2 minutos (reduzido para dados mais atualiza
 // Usando SEMANAS DE CALENDÁRIO (Domingo a Sábado)
 // ============================================================================
 
-/**
- * Retorna o início da semana (Domingo às 00:00) para uma data
- */
-function getWeekStart(date: Date): Date {
-  const d = new Date(date);
-  const day = d.getDay(); // 0 = Domingo, 1 = Segunda, etc.
-  d.setDate(d.getDate() - day); // Volta para o Domingo
-  d.setHours(0, 0, 0, 0);
-  return d;
-}
-
-/**
- * Retorna o fim da semana (Sábado às 23:59:59) para uma data
- */
-function getWeekEnd(date: Date): Date {
-  const d = new Date(date);
-  const day = d.getDay();
-  d.setDate(d.getDate() + (6 - day)); // Avança para o Sábado
-  d.setHours(23, 59, 59, 999);
-  return d;
-}
-
 async function calculateChurnStatus(idMember: number, frequenciaEsperada: number, authB64: string): Promise<ChurnStatus> {
   // FREQUÊNCIA PADRÃO: 5x por semana se não tiver definido no treino
   const freqEsperadaReal = frequenciaEsperada > 0 ? frequenciaEsperada : 5;
@@ -336,73 +314,81 @@ async function calculateChurnStatus(idMember: number, frequenciaEsperada: number
     console.log(`  Dia da semana Brasil: ${['Dom','Seg','Ter','Qua','Qui','Sex','Sáb'][nowBrazil.getDay()]}`);
     
     // =========================================================================
-    // CALCULAR SEMANAS DE CALENDÁRIO (Domingo a Sábado) no horário do Brasil
+    // CALCULAR SEMANAS DE CALENDÁRIO (Domingo a Sábado) - LÓGICA SIMPLIFICADA
+    // Mesma lógica do resync-one que FUNCIONA!
     // =========================================================================
     
-    // Início da semana atual (domingo 00:00 no Brasil)
-    const dayOfWeek = nowBrazil.getDay(); // 0 = Domingo
-    const thisWeekStart = new Date(nowBrazil);
-    thisWeekStart.setDate(nowBrazil.getDate() - dayOfWeek);
-    thisWeekStart.setHours(0, 0, 0, 0);
+    const dayOfWeek = nowBrazil.getDay();
+    const startOfThisWeek = new Date(nowBrazil);
+    startOfThisWeek.setDate(nowBrazil.getDate() - dayOfWeek);
+    startOfThisWeek.setHours(0, 0, 0, 0);
     
-    // Fim da semana atual (sábado 23:59:59 no Brasil)
-    const thisWeekEnd = new Date(thisWeekStart);
-    thisWeekEnd.setDate(thisWeekStart.getDate() + 6);
-    thisWeekEnd.setHours(23, 59, 59, 999);
+    const startOfLastWeek = new Date(startOfThisWeek);
+    startOfLastWeek.setDate(startOfLastWeek.getDate() - 7);
     
-    // SEMANA PASSADA
-    const lastWeekStart = new Date(thisWeekStart);
-    lastWeekStart.setDate(lastWeekStart.getDate() - 7);
-    const lastWeekEnd = new Date(lastWeekStart);
-    lastWeekEnd.setDate(lastWeekEnd.getDate() + 6);
-    lastWeekEnd.setHours(23, 59, 59, 999);
+    const startOf2WeeksAgo = new Date(startOfLastWeek);
+    startOf2WeeksAgo.setDate(startOf2WeeksAgo.getDate() - 7);
     
-    // 2 SEMANAS ATRÁS
-    const twoWeeksAgoStart = new Date(thisWeekStart);
-    twoWeeksAgoStart.setDate(twoWeeksAgoStart.getDate() - 14);
-    const twoWeeksAgoEnd = new Date(twoWeeksAgoStart);
-    twoWeeksAgoEnd.setDate(twoWeeksAgoEnd.getDate() + 6);
-    twoWeeksAgoEnd.setHours(23, 59, 59, 999);
-    
-    console.log(`[Churn] Membro ${idMember} - Semanas (Brasil):`);
-    console.log(`  Esta semana: ${thisWeekStart.toISOString().split('T')[0]} (Dom) a ${thisWeekEnd.toISOString().split('T')[0]} (Sáb)`);
-    console.log(`  Sem passada: ${lastWeekStart.toISOString().split('T')[0]} (Dom) a ${lastWeekEnd.toISOString().split('T')[0]} (Sáb)`);
-    console.log(`  2 sem atrás: ${twoWeeksAgoStart.toISOString().split('T')[0]} (Dom) a ${twoWeeksAgoEnd.toISOString().split('T')[0]} (Sáb)`);
+    console.log(`[Churn] Membro ${idMember} - Semanas:`);
+    console.log(`  Esta semana desde: ${startOfThisWeek.toISOString().split('T')[0]}`);
+    console.log(`  Sem passada desde: ${startOfLastWeek.toISOString().split('T')[0]}`);
+    console.log(`  2 sem atrás desde: ${startOf2WeeksAgo.toISOString().split('T')[0]}`);
     
     // Buscar 30 dias para ter margem
     const date30DaysAgo = new Date(nowBrazil.getTime() - 30 * 24 * 60 * 60 * 1000);
-    
-    // CORREÇÃO: Usar formato de data simples (YYYY-MM-DD) em vez de ISO completo
     const dateStartParam = date30DaysAgo.toISOString().split('T')[0];
     
-    // Tentar diferentes endpoints/parâmetros
     const entriesUrl = `https://evo-integracao-api.w12app.com.br/api/v1/entries?idMember=${idMember}&registerDateStart=${dateStartParam}&take=200`;
     
     console.log(`[Churn] URL de entradas: ${entriesUrl}`);
     
-    const resp = await fetch(entriesUrl, {
-      headers: { Authorization: `Basic ${authB64}` },
-      cache: 'no-store',
-    });
+    // =========================================================================
+    // RETRY: Tentar até 3 vezes se falhar
+    // =========================================================================
+    let entries: any[] = [];
+    let lastError: string | null = null;
     
-    console.log(`[Churn] Resposta HTTP: ${resp.status} ${resp.statusText}`);
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const resp = await fetch(entriesUrl, {
+          headers: { Authorization: `Basic ${authB64}` },
+          cache: 'no-store',
+        });
+        
+        console.log(`[Churn] Tentativa ${attempt} - HTTP: ${resp.status}`);
+        
+        if (!resp.ok) {
+          lastError = `HTTP ${resp.status}`;
+          if (attempt < 3) {
+            await new Promise(r => setTimeout(r, 500 * attempt)); // Espera progressiva
+            continue;
+          }
+        } else {
+          const data = await resp.json();
+          if (Array.isArray(data)) {
+            entries = data;
+            break;
+          } else {
+            lastError = 'Resposta não é array';
+            console.log(`[Churn] Resposta não é array:`, JSON.stringify(data).substring(0, 200));
+          }
+        }
+      } catch (fetchErr) {
+        lastError = fetchErr instanceof Error ? fetchErr.message : 'Erro desconhecido';
+        console.error(`[Churn] Tentativa ${attempt} falhou:`, lastError);
+        if (attempt < 3) {
+          await new Promise(r => setTimeout(r, 500 * attempt));
+        }
+      }
+    }
     
-    if (!resp.ok) {
-      console.error(`[Churn] Erro ao buscar entradas: ${resp.status}`);
+    if (entries.length === 0 && lastError) {
+      console.error(`[Churn] ⚠️ FALHA ao buscar entradas do membro ${idMember} após 3 tentativas: ${lastError}`);
+      // IMPORTANTE: Retorna default mas loga claramente o erro
       return defaultStatus;
     }
     
-    const entries = await resp.json();
-    
-    // Debug: mostrar tipo de resposta
-    console.log(`[Churn] Tipo de resposta: ${typeof entries}, isArray: ${Array.isArray(entries)}`);
-    
-    if (!Array.isArray(entries)) {
-      console.log(`[Churn] Resposta não é array para membro ${idMember}:`, JSON.stringify(entries).substring(0, 200));
-      return defaultStatus;
-    }
-    
-    console.log(`[Churn] Membro ${idMember}: ${entries.length} entradas brutas encontradas`);
+    console.log(`[Churn] Membro ${idMember}: ${entries.length} entradas encontradas`);
     
     // Debug: mostrar primeira entrada se existir
     if (entries.length > 0) {
@@ -415,58 +401,36 @@ async function calculateChurnStatus(idMember: number, frequenciaEsperada: number
     const daysTwoWeeksAgo = new Set<string>();
     
     for (const entry of entries) {
-      // CORREÇÃO: Aceitar TODAS as entradas que têm data
-      // O EVO pode usar diferentes nomes para o tipo de entrada
-      // Apenas ignorar se explicitamente for um tipo não-físico
-      const entryType = (entry.entryType || '').toLowerCase();
+      if (!entry.date) continue;
       
-      // Ignorar APENAS tipos que claramente NÃO são entrada física
-      const isDefinitelyNotPhysical = 
-        entryType.includes('impressão') ||
-        entryType.includes('email') ||
-        entryType.includes('sms') ||
-        entryType.includes('notificação') ||
-        entryType.includes('notificacao');
-      
-      if (isDefinitelyNotPhysical || !entry.date) {
-        continue;
-      }
-      
-      // =====================================================================
-      // CORREÇÃO CRÍTICA: Timezone do Brasil
-      // O EVO retorna "2026-01-27T16:43:18" SEM timezone
-      // Mas o dado É no horário do Brasil (-03:00)
-      // Precisamos adicionar o timezone manualmente para comparação correta
-      // =====================================================================
+      // Adicionar timezone do Brasil se não tiver
       let entryDateStr = entry.date;
-      
-      // Se não tem timezone no final, adicionar -03:00 (Brasil)
       if (!entryDateStr.includes('+') && !entryDateStr.includes('Z') && !entryDateStr.endsWith('-03:00')) {
         entryDateStr = entryDateStr + '-03:00';
       }
       
       const entryDate = new Date(entryDateStr);
-      
       if (isNaN(entryDate.getTime())) {
         console.log(`[Churn] Data inválida: ${entry.date}`);
         continue;
       }
       
-      // Extrair apenas a data (YYYY-MM-DD) da string original (já está no horário do Brasil)
+      // Extrair apenas a data (YYYY-MM-DD)
       const dayKey = entry.date.split('T')[0];
-      const entryTime = entryDate.getTime();
       
-      // Verificar em qual semana de calendário a entrada está
-      // Usar getTime() para comparação precisa de timestamps
-      if (entryTime >= thisWeekStart.getTime() && entryTime <= thisWeekEnd.getTime()) {
+      // =====================================================================
+      // COMPARAÇÃO SIMPLIFICADA - Mesma lógica do resync-one que FUNCIONA!
+      // Usar comparação direta de Date >= Date
+      // =====================================================================
+      if (entryDate >= startOfThisWeek) {
         daysThisWeek.add(dayKey);
-        console.log(`[Churn]   ${dayKey} (${entryType || 'sem tipo'}) -> Esta semana ✓`);
-      } else if (entryTime >= lastWeekStart.getTime() && entryTime <= lastWeekEnd.getTime()) {
+        console.log(`[Churn]   ${dayKey} -> Esta semana ✓`);
+      } else if (entryDate >= startOfLastWeek) {
         daysLastWeek.add(dayKey);
-        console.log(`[Churn]   ${dayKey} (${entryType || 'sem tipo'}) -> Sem passada ✓`);
-      } else if (entryTime >= twoWeeksAgoStart.getTime() && entryTime <= twoWeeksAgoEnd.getTime()) {
+        console.log(`[Churn]   ${dayKey} -> Sem passada ✓`);
+      } else if (entryDate >= startOf2WeeksAgo) {
         daysTwoWeeksAgo.add(dayKey);
-        console.log(`[Churn]   ${dayKey} (${entryType || 'sem tipo'}) -> 2 sem atrás ✓`);
+        console.log(`[Churn]   ${dayKey} -> 2 sem atrás ✓`);
       }
     }
     
@@ -920,6 +884,113 @@ export async function GET() {
       );
     }
 
+    // =========================================================================
+    // AUTO-CORREÇÃO: Atualizar frequência de membros com freq_atual=0
+    // Isso corrige membros que entraram com frequência zerada por erro de API
+    // Processa até 5 membros por sync para não sobrecarregar
+    // =========================================================================
+    let autoFixedCount = 0;
+    try {
+      const { data: membersToFix } = await supabase
+        .from('queue')
+        .select('id, evo_member_id, member_name, freq_atual, freq_08_14, freq_15_21, has_ficha, ficha_vencida, has_avaliacao, avaliacao_vencida')
+        .is('check_out_time', null)
+        .eq('freq_atual', 0)
+        .eq('freq_08_14', 0)
+        .not('evo_member_id', 'is', null)
+        .limit(5);
+
+      if (membersToFix && membersToFix.length > 0) {
+        console.log(`[SYNC] Auto-correção: ${membersToFix.length} membros com frequência zerada`);
+        
+        // Calcular datas das semanas
+        const now = new Date();
+        const BRAZIL_OFFSET_MINUTES = -180;
+        const nowBrazilMs = now.getTime() + (now.getTimezoneOffset() + BRAZIL_OFFSET_MINUTES) * 60 * 1000;
+        const nowBrazil = new Date(nowBrazilMs);
+        
+        const dayOfWeek = nowBrazil.getDay();
+        const startOfThisWeek = new Date(nowBrazil);
+        startOfThisWeek.setDate(nowBrazil.getDate() - dayOfWeek);
+        startOfThisWeek.setHours(0, 0, 0, 0);
+        
+        const startOfLastWeek = new Date(startOfThisWeek);
+        startOfLastWeek.setDate(startOfLastWeek.getDate() - 7);
+        
+        const startOf2WeeksAgo = new Date(startOfLastWeek);
+        startOf2WeeksAgo.setDate(startOf2WeeksAgo.getDate() - 7);
+
+        const date30DaysAgo = new Date(nowBrazil.getTime() - 30 * 24 * 60 * 60 * 1000);
+        const dateStartParam = date30DaysAgo.toISOString().split('T')[0];
+
+        for (const member of membersToFix) {
+          try {
+            const entriesUrl = `https://evo-integracao-api.w12app.com.br/api/v1/entries?idMember=${member.evo_member_id}&registerDateStart=${dateStartParam}&take=200`;
+            const entriesResp = await fetch(entriesUrl, { headers: { Authorization: `Basic ${auth}` }, cache: 'no-store' });
+            
+            if (!entriesResp.ok) continue;
+            
+            const entries = await entriesResp.json();
+            if (!Array.isArray(entries)) continue;
+
+            const diasSemanaAtual = new Set<string>();
+            const diasSemanaPassada = new Set<string>();
+            const dias2SemanasAtras = new Set<string>();
+            
+            for (const entry of entries) {
+              if (!entry.date) continue;
+              let entryDateStr = entry.date;
+              if (!entryDateStr.includes('+') && !entryDateStr.includes('Z') && !entryDateStr.endsWith('-03:00')) {
+                entryDateStr = entryDateStr + '-03:00';
+              }
+              const entryDate = new Date(entryDateStr);
+              if (isNaN(entryDate.getTime())) continue;
+              const diaKey = entry.date.split('T')[0];
+              
+              if (entryDate >= startOfThisWeek) {
+                diasSemanaAtual.add(diaKey);
+              } else if (entryDate >= startOfLastWeek) {
+                diasSemanaPassada.add(diaKey);
+              } else if (entryDate >= startOf2WeeksAgo) {
+                dias2SemanasAtras.add(diaKey);
+              }
+            }
+
+            const freqAtual = diasSemanaAtual.size;
+            const freq08_14 = diasSemanaPassada.size;
+            const freq15_21 = dias2SemanasAtras.size;
+
+            // Só atualiza se realmente tem frequência
+            if (freqAtual > 0 || freq08_14 > 0 || freq15_21 > 0) {
+              // Calcular retention_score
+              let retentionScore = 0;
+              const freqReal = freqAtual > 0 ? freqAtual : freq08_14;
+              if (freqReal > 0) {
+                retentionScore += Math.min(50, Math.round((freqReal / 3) * 50));
+              }
+              if (member.has_ficha && !member.ficha_vencida) retentionScore += 25;
+              else if (member.has_ficha && member.ficha_vencida) retentionScore += 12;
+              if (member.has_avaliacao && !member.avaliacao_vencida) retentionScore += 25;
+              else if (member.has_avaliacao && member.avaliacao_vencida) retentionScore += 12;
+
+              await supabase
+                .from('queue')
+                .update({ freq_atual: freqAtual, freq_08_14: freq08_14, freq_15_21: freq15_21, retention_score: retentionScore })
+                .eq('id', member.id);
+
+              autoFixedCount++;
+              console.log(`[SYNC] ✅ Auto-corrigido: ${member.member_name} (${freqAtual}/${freq08_14}/${freq15_21})`);
+            }
+          } catch (fixErr) {
+            console.error(`[SYNC] Erro ao auto-corrigir ${member.member_name}:`, fixErr);
+          }
+        }
+      }
+    } catch (autoFixErr) {
+      console.error('[SYNC] Erro na auto-correção:', autoFixErr);
+    }
+    // =========================================================================
+
     // 6) Buscar ativos
     const { data: activeQueue } = await supabase
       .from('queue')
@@ -952,6 +1023,7 @@ export async function GET() {
         added,
         removed,
         skipped,
+        autoFixed: autoFixedCount,
         addedMembers,
         removedMembers,
         allActiveEntries,

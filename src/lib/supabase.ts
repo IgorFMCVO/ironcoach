@@ -1323,3 +1323,166 @@ export function subscribeToCoachSessions(
     supabase.removeChannel(channel);
   };
 }
+
+// ============================================================================
+// SISTEMA DE CARDIO - Gerenciar alunos fazendo cardio
+// ============================================================================
+
+export interface CardioMember {
+  id: string;
+  memberName: string;
+  priority: Priority;
+  photoUrl?: string;
+  cardioStartedAt: string;
+  cardioDurationMinutes: number;
+  cardioDestination: 'QUEUE' | 'FINISHED';
+  cardioStartedByCoachName: string;
+  checkInTime: string;
+}
+
+/**
+ * Inicia cardio para um membro
+ */
+export async function startMemberCardio(
+  queueId: string,
+  coachId: string,
+  coachName: string,
+  durationMinutes: number,
+  destination: 'QUEUE' | 'FINISHED'
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    const { data, error } = await supabase.rpc('start_member_cardio', {
+      p_queue_id: queueId,
+      p_coach_id: coachId,
+      p_coach_name: coachName,
+      p_duration_minutes: durationMinutes,
+      p_destination: destination,
+    });
+
+    if (error) {
+      console.error('Erro ao iniciar cardio:', error);
+      return { success: false, error: error.message };
+    }
+
+    return data as { success: boolean; error?: string };
+  } catch (e) {
+    console.error('Exceção ao iniciar cardio:', e);
+    return { success: false, error: String(e) };
+  }
+}
+
+/**
+ * Finaliza cardio de um membro (automático ou manual)
+ */
+export async function finishMemberCardio(
+  queueId: string
+): Promise<{ success: boolean; destination?: string; error?: string }> {
+  try {
+    const { data, error } = await supabase.rpc('finish_member_cardio', {
+      p_queue_id: queueId,
+    });
+
+    if (error) {
+      console.error('Erro ao finalizar cardio:', error);
+      return { success: false, error: error.message };
+    }
+
+    return data as { success: boolean; destination?: string; error?: string };
+  } catch (e) {
+    console.error('Exceção ao finalizar cardio:', e);
+    return { success: false, error: String(e) };
+  }
+}
+
+/**
+ * Busca membros em cardio
+ */
+export async function getCardioMembers(): Promise<CardioMember[]> {
+  try {
+    const { data, error } = await supabase.rpc('get_cardio_members');
+
+    if (error) {
+      console.error('Erro ao buscar membros em cardio:', error);
+      return [];
+    }
+
+    return (data?.members || []) as CardioMember[];
+  } catch (e) {
+    console.error('Exceção ao buscar membros em cardio:', e);
+    return [];
+  }
+}
+
+// ============================================================================
+// USUÁRIOS ONLINE - Todos os usuários logados no sistema
+// ============================================================================
+
+export interface OnlineUser {
+  sessionId: string;
+  odrinUserId: string;
+  name: string;
+  status: 'ACTIVE' | 'PAUSED' | 'OFFLINE';
+  userType: 'ADMIN' | 'SUPERVISOR' | 'PROFESSOR';
+  currentQueueId: string | null;
+  suggestedQueueId: string | null;
+  pauseReason: string | null;
+  lastActivityAt: string;
+  initials: string;
+}
+
+export interface OnlineUsersData {
+  coaches: OnlineUser[];
+  consultoras: OnlineUser[];
+  totalOnline: number;
+}
+
+/**
+ * Busca todos os usuários online
+ */
+export async function getAllOnlineUsers(): Promise<OnlineUsersData> {
+  try {
+    const { data, error } = await supabase.rpc('get_all_online_users');
+
+    if (error) {
+      console.error('Erro ao buscar usuários online:', error);
+      return { coaches: [], consultoras: [], totalOnline: 0 };
+    }
+
+    return {
+      coaches: (data?.coaches || []) as OnlineUser[],
+      consultoras: (data?.consultoras || []) as OnlineUser[],
+      totalOnline: data?.totalOnline || 0,
+    };
+  } catch (e) {
+    console.error('Exceção ao buscar usuários online:', e);
+    return { coaches: [], consultoras: [], totalOnline: 0 };
+  }
+}
+
+/**
+ * Subscreve para atualizações de membros em cardio
+ */
+export function subscribeToCardioMembers(
+  callback: (members: CardioMember[]) => void
+): () => void {
+  const channel = supabase
+    .channel('cardio_members_changes')
+    .on(
+      'postgres_changes',
+      {
+        event: '*',
+        schema: 'public',
+        table: 'queue',
+        filter: 'status=eq.DOING_CARDIO',
+      },
+      async () => {
+        const members = await getCardioMembers();
+        callback(members);
+      }
+    )
+    .subscribe();
+
+  return () => {
+    supabase.removeChannel(channel);
+  };
+}
