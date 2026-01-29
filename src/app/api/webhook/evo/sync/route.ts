@@ -69,6 +69,7 @@ interface MemberAlerts {
   semAvaliacao: boolean;
   avaliacaoVencida: boolean;
   semMonitoramento: boolean;
+  monitoramentoVencido: boolean;
 }
 
 interface WorkoutInfo {
@@ -503,6 +504,7 @@ async function getMemberInfo(idMember: number, authB64: string): Promise<MemberI
     semAvaliacao: false,
     avaliacaoVencida: false,
     semMonitoramento: true,
+    monitoramentoVencido: false,
   };
   
   let workout: WorkoutInfo | null = null;
@@ -564,22 +566,38 @@ async function getMemberInfo(idMember: number, authB64: string): Promise<MemberI
         const avaliacaoServiceIds = [157, 158, 159, 160, 163, 164, 168, 169, 185, 186, 187, 188];
         const avaliacaoKeywords = ['AVALIA', 'BIOIMPEDÂNCIA', 'BIOIMPEDANCIA', 'REAVALIA'];
         
-        // Procurar por vendas de avaliação
+        // Keywords para MONITORAMENTO
+        const monitoramentoKeywords = ['MONITORAMENTO', 'MONITORA', 'ACOMPANHAMENTO'];
+        
+        // Procurar por vendas de avaliação e monitoramento
         let ultimaAvaliacaoDate: Date | null = null;
+        let ultimoMonitoramentoDate: Date | null = null;
         
         for (const sale of salesData) {
           const saleDate = sale.saleDate ? new Date(sale.saleDate) : null;
           
           // Verificar cada item da venda
           for (const item of (sale.saleItens || [])) {
-            const isAvaliacaoById = avaliacaoServiceIds.includes(item.idService);
             const itemName = (item.item || item.description || '').toUpperCase();
+            
+            // Verificar AVALIAÇÃO
+            const isAvaliacaoById = avaliacaoServiceIds.includes(item.idService);
             const isAvaliacaoByName = avaliacaoKeywords.some(kw => itemName.includes(kw));
             
             if ((isAvaliacaoById || isAvaliacaoByName) && saleDate) {
               if (!ultimaAvaliacaoDate || saleDate > ultimaAvaliacaoDate) {
                 ultimaAvaliacaoDate = saleDate;
                 console.log(`[getMemberInfo] Avaliação encontrada: "${item.item}" em ${saleDate.toISOString()}`);
+              }
+            }
+            
+            // Verificar MONITORAMENTO
+            const isMonitoramentoByName = monitoramentoKeywords.some(kw => itemName.includes(kw));
+            
+            if (isMonitoramentoByName && saleDate) {
+              if (!ultimoMonitoramentoDate || saleDate > ultimoMonitoramentoDate) {
+                ultimoMonitoramentoDate = saleDate;
+                console.log(`[getMemberInfo] Monitoramento encontrado: "${item.item}" em ${saleDate.toISOString()}`);
               }
             }
           }
@@ -600,6 +618,23 @@ async function getMemberInfo(idMember: number, authB64: string): Promise<MemberI
             console.log(`[getMemberInfo] Membro ${idMember}: Avaliação OK (${diasDesdeAvaliacao} dias desde última)`);
           }
         }
+        
+        // Definir status do monitoramento
+        const VALIDADE_MONITORAMENTO_DIAS = 60;
+        if (!ultimoMonitoramentoDate) {
+          alerts.semMonitoramento = true;
+          console.log(`[getMemberInfo] Membro ${idMember}: SEM MONITORAMENTO (nunca comprou)`);
+        } else {
+          alerts.semMonitoramento = false;
+          const diasDesdeMonitoramento = Math.floor((Date.now() - ultimoMonitoramentoDate.getTime()) / (1000 * 60 * 60 * 24));
+          
+          if (diasDesdeMonitoramento > VALIDADE_MONITORAMENTO_DIAS) {
+            alerts.monitoramentoVencido = true;
+            console.log(`[getMemberInfo] Membro ${idMember}: MONITORAMENTO VENCIDO (${diasDesdeMonitoramento} dias desde último)`);
+          } else {
+            console.log(`[getMemberInfo] Membro ${idMember}: Monitoramento OK (${diasDesdeMonitoramento} dias desde último)`);
+          }
+        }
       } else {
         console.error(`[getMemberInfo] Erro ao buscar sales ${idMember}: ${salesResp.status}`);
         // Se não conseguir buscar sales, marcar como sem avaliação por segurança
@@ -610,36 +645,120 @@ async function getMemberInfo(idMember: number, authB64: string): Promise<MemberI
       alerts.semAvaliacao = true;
     }
 
-    // 3. Buscar treinos
+    // 3. Buscar treinos - USAR inactive=true PARA PEGAR TREINOS VENCIDOS
     console.log(`[getMemberInfo] Buscando treinos do membro ${idMember}...`);
+    
+    let todosOsTreinos: any[] = [];
+    
+    // ENDPOINT COM inactive=true (retorna treinos ativos E inativos/vencidos)
     const workoutResp = await fetch(
-      `https://evo-integracao-api.w12app.com.br/api/v1/workout/default-client-workout?idClient=${idMember}`,
+      `https://evo-integracao-api.w12app.com.br/api/v1/workout/default-client-workout?idClient=${idMember}&inactive=true`,
       { headers: { Authorization: `Basic ${authB64}` }, cache: 'no-store' }
     );
 
     if (workoutResp.ok) {
       const workoutData = await workoutResp.json();
-      const treinos = workoutData.treinos || [];
-      console.log(`[getMemberInfo] Treinos encontrados: ${treinos.length}`);
+      todosOsTreinos = workoutData.treinos || [];
+      console.log(`[getMemberInfo] Treinos encontrados (com inativos): ${todosOsTreinos.length}`);
+    } else {
+      console.log(`[getMemberInfo] Erro HTTP ${workoutResp.status} ao buscar treinos`);
+    }
+
+    console.log(`[getMemberInfo] Total de treinos encontrados: ${todosOsTreinos.length}`);
+    
+    if (todosOsTreinos.length === 0) {
+      alerts.semFicha = true;
+      console.log(`[getMemberInfo] Membro ${idMember}: SEM FICHA (nenhum treino em nenhum endpoint)`);
+    } else {
+      const hoje = new Date();
       
-      if (treinos.length === 0) {
-        alerts.semFicha = true;
-        console.log(`[getMemberInfo] Membro ${idMember}: SEM FICHA`);
+      // =====================================================================
+      // CORREÇÃO CRÍTICA: Filtrar treinos ATIVOS e NÃO VENCIDOS
+      // PRIORIDADE: dataValidade > statusTreino
+      // Se a data de validade está no FUTURO, o treino é considerado ATIVO
+      // =====================================================================
+      const treinosAtivosValidos = todosOsTreinos.filter((t: any) => {
+        // Excluir treinos deletados
+        if (t.flExcluido === true) {
+          console.log(`[getMemberInfo]   Treino "${t.nomeTreino}" excluído, ignorando`);
+          return false;
+        }
+        
+        // CORREÇÃO: Verificar APENAS data de validade
+        // Se tem data e está vencida, ignorar
+        if (t.dataValidade) {
+          const validade = new Date(t.dataValidade);
+          if (validade < hoje) {
+            console.log(`[getMemberInfo]   Treino "${t.nomeTreino}" VENCIDO em ${t.dataValidade}`);
+            return false;
+          }
+          // Se tem data e está no futuro, é ATIVO (independente de statusTreino)
+          console.log(`[getMemberInfo]   Treino "${t.nomeTreino}" ATIVO (validade: ${t.dataValidade})`);
+          return true;
+        }
+        
+        // Se não tem data de validade, considerar ativo
+        console.log(`[getMemberInfo]   Treino "${t.nomeTreino}" sem data de validade, considerando ativo`);
+        return true;
+      });
+
+      console.log(`[getMemberInfo] Treinos ativos válidos: ${treinosAtivosValidos.length} de ${todosOsTreinos.length}`);
+
+      // Se não tem treinos ativos válidos
+      if (treinosAtivosValidos.length === 0) {
+        // Verificar se tem algum treino vencido (por DATA, não por status)
+        const treinosVencidos = todosOsTreinos.filter((t: any) => {
+          if (t.flExcluido === true) return false;
+          // CORREÇÃO: Apenas considerar vencido se a DATA está no passado
+          if (t.dataValidade) {
+            return new Date(t.dataValidade) < hoje;
+          }
+          return false; // Sem data = não considerar vencido
+        });
+
+        if (treinosVencidos.length > 0) {
+          // Tem treino mas está vencido
+          alerts.fichaVencida = true;
+          console.log(`[getMemberInfo] ⚠️ Membro ${idMember}: FICHA VENCIDA (${treinosVencidos.length} treinos vencidos)`);
+          
+          // Usar o treino vencido mais recente para mostrar info
+          const treinoMaisRecente = treinosVencidos.sort((a: any, b: any) => {
+            const dataA = a.dataValidade ? new Date(a.dataValidade).getTime() : 0;
+            const dataB = b.dataValidade ? new Date(b.dataValidade).getTime() : 0;
+            return dataB - dataA;
+          })[0];
+          
+          frequenciaSemana = treinoMaisRecente.frequenciaSemana || 0;
+          
+          workout = {
+            idTreino: treinoMaisRecente.idTreino || null,
+            nomeTreino: treinoMaisRecente.nomeTreino || null,
+            serieAtual: treinoMaisRecente.series?.[0]?.nome || null,
+            tags: (treinoMaisRecente.tags || []).map((t: any) => t.nome).filter(Boolean),
+            dataValidade: treinoMaisRecente.dataValidade || null,
+            frequenciaSemana,
+            sessoesConcluidas: treinoMaisRecente.sessoesConcluidas || 0,
+            quantidadeSessoes: treinoMaisRecente.quantidadeSessoes || 0,
+            nomeProfessor: treinoMaisRecente.nomeProfessor || null,
+          };
+        } else {
+          // Não tem nenhum treino válido ou vencido, está sem ficha
+          alerts.semFicha = true;
+          console.log(`[getMemberInfo] Membro ${idMember}: SEM FICHA (todos excluídos)`);
+        }
       } else {
-        const treino = treinos[0];
+        // Tem treino ativo válido - usar o primeiro
+        const treino = treinosAtivosValidos[0];
         const dataValidade = treino.dataValidade;
         
-        console.log(`[getMemberInfo] Membro ${idMember}: Ficha "${treino.nomeTreino}", Validade: ${dataValidade || 'não definida'}`);
+        console.log(`[getMemberInfo] ✅ Membro ${idMember}: Ficha ATIVA "${treino.nomeTreino}", Validade: ${dataValidade || 'não definida'}`);
         
+        // Verificar se está perto de vencer (alerta)
         if (dataValidade) {
           const validadeDate = new Date(dataValidade);
-          const hoje = new Date();
           const diasRestantes = Math.floor((validadeDate.getTime() - hoje.getTime()) / (1000 * 60 * 60 * 24));
           
-          if (validadeDate < hoje) {
-            alerts.fichaVencida = true;
-            console.log(`[getMemberInfo] ⚠️ FICHA VENCIDA há ${Math.abs(diasRestantes)} dias`);
-          } else if (diasRestantes <= 7) {
+          if (diasRestantes <= 7) {
             console.log(`[getMemberInfo] ⏰ Ficha vence em ${diasRestantes} dias`);
           }
         }
@@ -664,12 +783,9 @@ async function getMemberInfo(idMember: number, authB64: string): Promise<MemberI
           nomeProfessor: treino.nomeProfessor || null,
         };
       }
-    } else {
-      console.error(`[getMemberInfo] Erro ao buscar treinos ${idMember}: ${workoutResp.status}`);
-      alerts.semFicha = true;
     }
 
-    // 3. Buscar serviços
+    // 4. Buscar serviços
     console.log(`[getMemberInfo] Buscando serviços do membro ${idMember}...`);
     const servicesResp = await fetch(
       `https://evo-integracao-api.w12app.com.br/api/v1/members/services?idMember=${idMember}`,
@@ -846,6 +962,8 @@ export async function GET() {
           has_avaliacao: !memberInfo.alerts.semAvaliacao,
           ficha_vencida: memberInfo.alerts.fichaVencida,
           avaliacao_vencida: memberInfo.alerts.avaliacaoVencida,
+          has_monitoramento: !memberInfo.alerts.semMonitoramento,
+          monitoramento_vencido: memberInfo.alerts.monitoramentoVencido,
         });
         added++;
         addedMembers.push({

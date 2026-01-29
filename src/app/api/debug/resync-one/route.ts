@@ -127,11 +127,124 @@ export async function GET(request: NextRequest) {
 
     log(`[2] Frequência calculada: atual=${freqAtual}, passada=${freq08_14}, 2sem=${freq15_21}`);
 
-    // 2.5 Calcular retention_score
-    log(`[2.5] Calculando retention_score...`);
+    // =========================================================================
+    // 2.5 Buscar FICHA de treino do EVO (COM inactive=true para pegar vencidos)
+    // =========================================================================
+    log(`[2.5] Buscando ficha de treino do EVO...`);
+    
+    let hasFicha = false;
+    let fichaVencida = false;
+    let workoutName: string | null = null;
+    let workoutId: number | null = null;
+    let workoutValidUntil: string | null = null;
+    let freqEsperada = 3; // Default
+
+    try {
+      const workoutUrl = `${EVO_API}/api/v1/workout/default-client-workout?idClient=${evoId}&inactive=true`;
+      log(`[2.5] URL: ${workoutUrl}`);
+      
+      const workoutResp = await fetch(workoutUrl, { headers, cache: 'no-store' });
+      log(`[2.5] HTTP Status: ${workoutResp.status}`);
+      
+      if (workoutResp.ok) {
+        const workoutData = await workoutResp.json();
+        const todosOsTreinos = workoutData.treinos || [];
+        log(`[2.5] Total de treinos: ${todosOsTreinos.length}`);
+        
+        const hoje = new Date();
+        
+        // CORREÇÃO: Priorizar dataValidade sobre statusTreino
+        // Um treino é ATIVO se:
+        // 1. Não foi excluído (flExcluido !== true)
+        // 2. Data de validade está no FUTURO
+        const treinosAtivosValidos = todosOsTreinos.filter((t: any) => {
+          if (t.flExcluido === true) {
+            log(`[2.5]   Treino "${t.nomeTreino}" - EXCLUÍDO`);
+            return false;
+          }
+          
+          // Se tem data de validade, verificar se está no futuro
+          if (t.dataValidade) {
+            const validade = new Date(t.dataValidade);
+            const estaValido = validade > hoje;
+            if (!estaValido) {
+              log(`[2.5]   Treino "${t.nomeTreino}" - VENCIDO por data (${t.dataValidade})`);
+              return false;
+            }
+          }
+          
+          // Se chegou aqui, treino está válido!
+          log(`[2.5]   Treino "${t.nomeTreino}" - ATIVO (validade: ${t.dataValidade}, status: ${t.statusTreino})`);
+          return true;
+        });
+
+        log(`[2.5] Treinos ativos válidos: ${treinosAtivosValidos.length}`);
+
+        if (treinosAtivosValidos.length > 0) {
+          // Tem treino ativo válido - pegar o mais recente
+          const treino = treinosAtivosValidos.sort((a: any, b: any) => {
+            const dateA = a.dataInicio ? new Date(a.dataInicio).getTime() : 0;
+            const dateB = b.dataInicio ? new Date(b.dataInicio).getTime() : 0;
+            return dateB - dateA; // Mais recente primeiro
+          })[0];
+          
+          hasFicha = true;
+          fichaVencida = false;
+          workoutName = treino.nomeTreino || null;
+          workoutId = treino.idTreino || null;
+          workoutValidUntil = treino.dataValidade || null;
+          freqEsperada = treino.frequenciaSemana || treino.quantidadeSemanal || 3;
+          log(`[2.5] ✅ Ficha ATIVA: "${workoutName}" (validade: ${workoutValidUntil})`);
+        } else {
+          // Verificar se tem treinos vencidos (por data)
+          const treinosVencidos = todosOsTreinos.filter((t: any) => {
+            if (t.flExcluido === true) return false;
+            if (t.dataValidade && new Date(t.dataValidade) < hoje) return true;
+            return false;
+          });
+
+          log(`[2.5] Treinos vencidos: ${treinosVencidos.length}`);
+
+          if (treinosVencidos.length > 0) {
+            // Tem ficha mas está vencida - pegar o mais recente
+            const treino = treinosVencidos.sort((a: any, b: any) => {
+              const dateA = a.dataValidade ? new Date(a.dataValidade).getTime() : 0;
+              const dateB = b.dataValidade ? new Date(b.dataValidade).getTime() : 0;
+              return dateB - dateA; // Mais recente primeiro
+            })[0];
+            
+            hasFicha = true;
+            fichaVencida = true;
+            workoutName = treino.nomeTreino || null;
+            workoutId = treino.idTreino || null;
+            workoutValidUntil = treino.dataValidade || null;
+            freqEsperada = treino.frequenciaSemana || treino.quantidadeSemanal || 3;
+            log(`[2.5] ⚠️ Ficha VENCIDA: "${workoutName}" (venceu em: ${workoutValidUntil})`);
+          } else {
+            // Sem ficha
+            hasFicha = false;
+            fichaVencida = false;
+            log(`[2.5] ❌ SEM FICHA`);
+          }
+        }
+      } else if (workoutResp.status === 429) {
+        log(`[2.5] ⚠️ Rate limit (429) - mantendo dados atuais da ficha`);
+        hasFicha = member.has_ficha || false;
+        fichaVencida = member.ficha_vencida || false;
+        workoutName = member.workout_name || null;
+        workoutId = member.workout_id || null;
+        workoutValidUntil = member.workout_valid_until || null;
+      }
+    } catch (workoutErr) {
+      log(`[2.5] Erro ao buscar ficha: ${workoutErr}`);
+    }
+
+    // =========================================================================
+    // 3. Calcular retention_score
+    // =========================================================================
+    log(`[3] Calculando retention_score...`);
     
     let retentionScore = 0;
-    const freqEsperada = 3; // Default
     
     // Frequência (max 50%)
     const freqReal = freqAtual > 0 ? freqAtual : freq08_14;
@@ -139,34 +252,42 @@ export async function GET(request: NextRequest) {
       retentionScore += Math.min(50, Math.round((freqReal / freqEsperada) * 50));
     }
     
-    // Ficha - vamos manter o valor atual do banco
-    if (member.has_ficha && !member.ficha_vencida) {
+    // Ficha (max 25%) - usando valores ATUALIZADOS
+    if (hasFicha && !fichaVencida) {
       retentionScore += 25;
-    } else if (member.has_ficha && member.ficha_vencida) {
+    } else if (hasFicha && fichaVencida) {
       retentionScore += 12;
     }
     
-    // Avaliação - vamos manter o valor atual do banco
+    // Avaliação (max 25%) - mantém valor atual do banco
     if (member.has_avaliacao && !member.avaliacao_vencida) {
       retentionScore += 25;
     } else if (member.has_avaliacao && member.avaliacao_vencida) {
       retentionScore += 12;
     }
     
-    log(`[2.5] Retention calculado: ${retentionScore}% (freq=${freqReal}/${freqEsperada}, ficha=${member.has_ficha}, aval=${member.has_avaliacao})`);
+    log(`[3] Retention calculado: ${retentionScore}% (freq=${freqReal}/${freqEsperada}, ficha=${hasFicha}${fichaVencida ? ' VENCIDA' : ''}, aval=${member.has_avaliacao})`);
 
-    // 3. Atualizar no banco
-    log(`[3] Atualizando banco de dados...`);
+    // =========================================================================
+    // 4. Atualizar no banco
+    // =========================================================================
+    log(`[4] Atualizando banco de dados...`);
     
-    const updateData = {
+    const updateData: any = {
       freq_atual: freqAtual,
       freq_08_14: freq08_14,
       freq_15_21: freq15_21,
       freq_esperada: freqEsperada,
       retention_score: retentionScore,
+      // NOVOS CAMPOS DE FICHA
+      has_ficha: hasFicha,
+      ficha_vencida: fichaVencida,
+      workout_name: workoutName,
+      workout_id: workoutId,
+      workout_valid_until: workoutValidUntil,
     };
 
-    log(`[3] Dados para UPDATE: ${JSON.stringify(updateData)}`);
+    log(`[4] Dados para UPDATE: ${JSON.stringify(updateData)}`);
 
     const { error: updateError, data: updateResult } = await supabase
       .from('queue')
@@ -175,8 +296,8 @@ export async function GET(request: NextRequest) {
       .select();
 
     if (updateError) {
-      log(`[3] ERRO no UPDATE: ${updateError.message}`);
-      log(`[3] Detalhes do erro: ${JSON.stringify(updateError)}`);
+      log(`[4] ERRO no UPDATE: ${updateError.message}`);
+      log(`[4] Detalhes do erro: ${JSON.stringify(updateError)}`);
       return NextResponse.json({ 
         error: 'Falha ao atualizar banco',
         errorDetails: updateError,
@@ -184,19 +305,20 @@ export async function GET(request: NextRequest) {
       }, { status: 500 });
     }
 
-    log(`[3] UPDATE executado com sucesso!`);
-    log(`[3] Resultado: ${JSON.stringify(updateResult)}`);
+    log(`[4] UPDATE executado com sucesso!`);
 
-    // 4. Verificar se atualizou
-    log(`[4] Verificando dados após UPDATE...`);
+    // =========================================================================
+    // 5. Verificar se atualizou
+    // =========================================================================
+    log(`[5] Verificando dados após UPDATE...`);
     
     const { data: memberAfter } = await supabase
       .from('queue')
-      .select('freq_atual, freq_08_14, freq_15_21, freq_esperada, retention_score')
+      .select('freq_atual, freq_08_14, freq_15_21, freq_esperada, retention_score, has_ficha, ficha_vencida, workout_name')
       .eq('id', member.id)
       .single();
 
-    log(`[4] Dados após UPDATE: ${JSON.stringify(memberAfter)}`);
+    log(`[5] Dados após UPDATE: ${JSON.stringify(memberAfter)}`);
 
     return NextResponse.json({
       success: true,
@@ -209,6 +331,9 @@ export async function GET(request: NextRequest) {
         freq_atual: member.freq_atual,
         freq_08_14: member.freq_08_14,
         freq_15_21: member.freq_15_21,
+        has_ficha: member.has_ficha,
+        ficha_vencida: member.ficha_vencida,
+        workout_name: member.workout_name,
       },
       calculated: {
         freq_atual: freqAtual,
@@ -217,6 +342,9 @@ export async function GET(request: NextRequest) {
         dias_atual: Array.from(diasSemanaAtual),
         dias_passada: Array.from(diasSemanaPassada),
         dias_2sem: Array.from(dias2SemanasAtras),
+        has_ficha: hasFicha,
+        ficha_vencida: fichaVencida,
+        workout_name: workoutName,
       },
       after: memberAfter,
       logs,

@@ -24,7 +24,7 @@ export const isSupabaseConfigured = Boolean(supabaseUrl && supabaseAnonKey);
 // ============================================================================
 
 export type Priority = 'RED' | 'ORANGE' | 'YELLOW' | 'BLUE' | 'GREEN' | 'BLACK';
-export type QueueStatus = 'WAITING' | 'TRAINING' | 'BEING_ATTENDED' | 'IDLE';
+export type QueueStatus = 'WAITING' | 'TRAINING' | 'BEING_ATTENDED' | 'IDLE' | 'DOING_CARDIO' | 'FINISHED';
 
 export interface Coach {
   id: string;
@@ -84,6 +84,8 @@ export async function getQueue(): Promise<QueueMember[]> {
     .from('queue')
     .select('*')
     .is('check_out_time', null)
+    .neq('status', 'DOING_CARDIO')  // Excluir membros em cardio - eles aparecem em seção separada
+    .neq('status', 'FINISHED')      // Excluir finalizados também
     .order('help_requested', { ascending: false })
     .order('priority', { ascending: true })
     .order('check_in_time', { ascending: true });

@@ -43,6 +43,8 @@ async function getCompleteMemberData(idMember: number) {
     fichaVencida: false,
     semAvaliacao: true,
     avaliacaoVencida: false,
+    semMonitoramento: true,
+    monitoramentoVencido: false,
   };
   
   let workout: { idTreino: number | null; nomeTreino: string | null; serieAtual: string | null; dataValidade: string | null; frequenciaSemana: number } | null = null;
@@ -71,20 +73,28 @@ async function getCompleteMemberData(idMember: number) {
       }
     }
 
-    // 2. Buscar SALES para verificar avaliações
+    // 2. Buscar SALES para verificar avaliações e monitoramentos
     const salesResp = await fetch(`${EVO_API}/api/v1/sales?idMember=${idMember}&take=100`, { headers, cache: 'no-store' });
     if (salesResp.ok) {
       const salesData = await salesResp.json();
+      
+      // IDs e keywords para AVALIAÇÃO
       const avaliacaoServiceIds = [157, 158, 159, 160, 163, 164, 168, 169, 185, 186, 187, 188];
       const avaliacaoKeywords = ['AVALIA', 'BIOIMPEDÂNCIA', 'BIOIMPEDANCIA', 'REAVALIA'];
       
+      // Keywords para MONITORAMENTO (ajustar conforme IDs reais do sistema EVO)
+      const monitoramentoKeywords = ['MONITORAMENTO', 'MONITORA', 'ACOMPANHAMENTO'];
+      
       let ultimaAvaliacaoDate: Date | null = null;
+      let ultimoMonitoramentoDate: Date | null = null;
       
       for (const sale of salesData) {
         const saleDate = sale.saleDate ? new Date(sale.saleDate) : null;
         for (const item of (sale.saleItens || [])) {
-          const isAvaliacaoById = avaliacaoServiceIds.includes(item.idService);
           const itemName = (item.item || item.description || '').toUpperCase();
+          
+          // Verificar AVALIAÇÃO
+          const isAvaliacaoById = avaliacaoServiceIds.includes(item.idService);
           const isAvaliacaoByName = avaliacaoKeywords.some(kw => itemName.includes(kw));
           
           if ((isAvaliacaoById || isAvaliacaoByName) && saleDate) {
@@ -92,9 +102,19 @@ async function getCompleteMemberData(idMember: number) {
               ultimaAvaliacaoDate = saleDate;
             }
           }
+          
+          // Verificar MONITORAMENTO
+          const isMonitoramentoByName = monitoramentoKeywords.some(kw => itemName.includes(kw));
+          
+          if (isMonitoramentoByName && saleDate) {
+            if (!ultimoMonitoramentoDate || saleDate > ultimoMonitoramentoDate) {
+              ultimoMonitoramentoDate = saleDate;
+            }
+          }
         }
       }
       
+      // Processar AVALIAÇÃO
       const VALIDADE_AVALIACAO_DIAS = 60;
       if (!ultimaAvaliacaoDate) {
         alerts.semAvaliacao = true;
@@ -103,6 +123,18 @@ async function getCompleteMemberData(idMember: number) {
         const diasDesdeAvaliacao = Math.floor((Date.now() - ultimaAvaliacaoDate.getTime()) / (1000 * 60 * 60 * 24));
         if (diasDesdeAvaliacao > VALIDADE_AVALIACAO_DIAS) {
           alerts.avaliacaoVencida = true;
+        }
+      }
+      
+      // Processar MONITORAMENTO (60 dias de validade)
+      const VALIDADE_MONITORAMENTO_DIAS = 60;
+      if (!ultimoMonitoramentoDate) {
+        alerts.semMonitoramento = true;
+      } else {
+        alerts.semMonitoramento = false;
+        const diasDesdeMonitoramento = Math.floor((Date.now() - ultimoMonitoramentoDate.getTime()) / (1000 * 60 * 60 * 24));
+        if (diasDesdeMonitoramento > VALIDADE_MONITORAMENTO_DIAS) {
+          alerts.monitoramentoVencido = true;
         }
       }
     }

@@ -2,7 +2,7 @@
 // CAMINHO: src/app/api/debug/resync-all/route.ts
 // ============================================================================
 // IRON COACH - Resync de TODOS os membros ativos na fila
-// Atualiza frequência, retention_score de todos os membros
+// Atualiza frequência, retention_score, ficha, avaliação de todos os membros
 // Acesse: /api/debug/resync-all
 // ============================================================================
 
@@ -17,15 +17,15 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
 );
 
-const EVO_API = 'https://evo-integracao-api.w12app.com.br';
+const EVO_API = 'https://evo-integracao-api.w12app.com.br/api/v1';
 const EVO_DNS = process.env.EVO_DNS || '';
 const EVO_API_KEY = process.env.EVO_API_KEY || '';
 
 interface ResyncResult {
   evoId: number;
   name: string;
-  before: { freq_atual: number; freq_08_14: number; freq_15_21: number };
-  after: { freq_atual: number; freq_08_14: number; freq_15_21: number; retention_score: number };
+  before: { freq_atual: number; freq_08_14: number; freq_15_21: number; has_ficha: boolean };
+  after: { freq_atual: number; freq_08_14: number; freq_15_21: number; has_ficha: boolean; retention_score: number };
   status: 'updated' | 'unchanged' | 'error';
   error?: string;
 }
@@ -46,7 +46,7 @@ export async function GET(request: NextRequest) {
     
     const { data: members, error: fetchError } = await supabase
       .from('queue')
-      .select('id, evo_member_id, member_name, freq_atual, freq_08_14, freq_15_21, has_ficha, ficha_vencida, has_avaliacao, avaliacao_vencida')
+      .select('id, evo_member_id, member_name, freq_atual, freq_08_14, freq_15_21, has_ficha, ficha_vencida, has_avaliacao, avaliacao_vencida, workout_name, workout_id, workout_valid_until')
       .is('check_out_time', null)
       .not('evo_member_id', 'is', null);
 
@@ -89,18 +89,21 @@ export async function GET(request: NextRequest) {
           freq_atual: member.freq_atual || 0,
           freq_08_14: member.freq_08_14 || 0,
           freq_15_21: member.freq_15_21 || 0,
+          has_ficha: member.has_ficha || false,
         },
-        after: { freq_atual: 0, freq_08_14: 0, freq_15_21: 0, retention_score: 0 },
+        after: { freq_atual: 0, freq_08_14: 0, freq_15_21: 0, has_ficha: false, retention_score: 0 },
         status: 'unchanged',
       };
 
       try {
-        // Buscar entradas do EVO com retry
+        // =====================================================
+        // A) Buscar FREQUÊNCIA do EVO
+        // =====================================================
         let entries: any[] = [];
         
         for (let attempt = 1; attempt <= 2; attempt++) {
           try {
-            const entriesUrl = `${EVO_API}/api/v1/entries?idMember=${evoId}&registerDateStart=${dateStartParam}&take=200`;
+            const entriesUrl = `${EVO_API}/entries?idMember=${evoId}&registerDateStart=${dateStartParam}&take=200`;
             const entriesResp = await fetch(entriesUrl, { headers, cache: 'no-store' });
             
             if (entriesResp.ok) {
@@ -146,7 +149,98 @@ export async function GET(request: NextRequest) {
         const freq08_14 = diasSemanaPassada.size;
         const freq15_21 = dias2SemanasAtras.size;
 
-        // Calcular retention_score
+        // =====================================================
+        // B) Buscar FICHA de treino do EVO
+        // USAR inactive=true PARA PEGAR TREINOS VENCIDOS
+        // =====================================================
+        let hasFicha = false;
+        let fichaVencida = false;
+        let workoutName: string | null = null;
+        let workoutId: number | null = null;
+        let workoutValidUntil: string | null = null;
+
+        try {
+          // Endpoint com inactive=true retorna treinos ativos E vencidos
+          const workoutUrl = `${EVO_API}/workout/default-client-workout?idClient=${evoId}&inactive=true`;
+          const workoutResp = await fetch(workoutUrl, { headers, cache: 'no-store' });
+          
+          if (workoutResp.ok) {
+            const workoutData = await workoutResp.json();
+            const todosOsTreinos = workoutData.treinos || [];
+            const hoje = new Date();
+            
+            // CORREÇÃO: Filtrar treinos por DATA DE VALIDADE apenas
+            // Se a data está no futuro, é ATIVO (independente de statusTreino)
+            const treinosAtivosValidos = todosOsTreinos.filter((t: any) => {
+              if (t.flExcluido === true) return false;
+              if (t.dataValidade) {
+                return new Date(t.dataValidade) > hoje; // Validade no FUTURO = ATIVO
+              }
+              return true; // Sem data de validade = considerar ativo
+            });
+
+            if (treinosAtivosValidos.length > 0) {
+              // Tem treino ativo válido - pegar o mais recente
+              const treino = treinosAtivosValidos.sort((a: any, b: any) => {
+                const dateA = a.dataInicio ? new Date(a.dataInicio).getTime() : 0;
+                const dateB = b.dataInicio ? new Date(b.dataInicio).getTime() : 0;
+                return dateB - dateA;
+              })[0];
+              
+              hasFicha = true;
+              fichaVencida = false;
+              workoutName = treino.nomeTreino || null;
+              workoutId = treino.idTreino || null;
+              workoutValidUntil = treino.dataValidade || null;
+            } else {
+              // Verificar se tem treinos vencidos (por DATA)
+              const treinosVencidos = todosOsTreinos.filter((t: any) => {
+                if (t.flExcluido === true) return false;
+                if (t.dataValidade && new Date(t.dataValidade) < hoje) return true;
+                return false;
+              });
+
+              if (treinosVencidos.length > 0) {
+                // Tem ficha mas está vencida - pegar o mais recente
+                const treino = treinosVencidos.sort((a: any, b: any) => {
+                  const dateA = a.dataValidade ? new Date(a.dataValidade).getTime() : 0;
+                  const dateB = b.dataValidade ? new Date(b.dataValidade).getTime() : 0;
+                  return dateB - dateA;
+                })[0];
+                
+                hasFicha = true;
+                fichaVencida = true;
+                workoutName = treino.nomeTreino || null;
+                workoutId = treino.idTreino || null;
+                workoutValidUntil = treino.dataValidade || null;
+                console.log(`[ResyncAll] ⚠️ ${member.member_name}: FICHA VENCIDA detectada`);
+              } else if (todosOsTreinos.length > 0) {
+                // Tem treinos mas todos estão excluídos - sem ficha
+                hasFicha = false;
+                fichaVencida = false;
+                console.log(`[ResyncAll] ❌ ${member.member_name}: Todos os treinos excluídos`);
+              } else {
+                // Sem ficha de verdade
+                hasFicha = false;
+                fichaVencida = false;
+              }
+            }
+          } else if (workoutResp.status === 429) {
+            // Rate limit - NÃO alterar dados existentes
+            console.log(`[ResyncAll] ⚠️ ${member.member_name}: Rate limit (429), mantendo dados atuais`);
+            hasFicha = member.has_ficha || false;
+            fichaVencida = member.ficha_vencida || false;
+            workoutName = member.workout_name || null;
+            workoutId = member.workout_id || null;
+            workoutValidUntil = member.workout_valid_until || null;
+          }
+        } catch (workoutErr) {
+          console.error(`[ResyncAll] Erro ao buscar ficha de ${member.member_name}:`, workoutErr);
+        }
+
+        // =====================================================
+        // C) Calcular retention_score
+        // =====================================================
         let retentionScore = 0;
         const freqEsperada = 3;
         
@@ -155,25 +249,37 @@ export async function GET(request: NextRequest) {
           retentionScore += Math.min(50, Math.round((freqReal / freqEsperada) * 50));
         }
         
-        if (member.has_ficha && !member.ficha_vencida) {
+        // Ficha
+        if (hasFicha && !fichaVencida) {
           retentionScore += 25;
-        } else if (member.has_ficha && member.ficha_vencida) {
+        } else if (hasFicha && fichaVencida) {
           retentionScore += 12;
         }
         
+        // Avaliação (manter do banco)
         if (member.has_avaliacao && !member.avaliacao_vencida) {
           retentionScore += 25;
         } else if (member.has_avaliacao && member.avaliacao_vencida) {
           retentionScore += 12;
         }
 
-        result.after = { freq_atual: freqAtual, freq_08_14: freq08_14, freq_15_21: freq15_21, retention_score: retentionScore };
+        result.after = { 
+          freq_atual: freqAtual, 
+          freq_08_14: freq08_14, 
+          freq_15_21: freq15_21, 
+          has_ficha: hasFicha,
+          retention_score: retentionScore 
+        };
 
         // Verificar se houve mudança
-        const changed = 
+        const freqChanged = 
           result.before.freq_atual !== freqAtual ||
           result.before.freq_08_14 !== freq08_14 ||
           result.before.freq_15_21 !== freq15_21;
+        
+        const fichaChanged = result.before.has_ficha !== hasFicha;
+        
+        const changed = freqChanged || fichaChanged;
 
         if (changed) {
           // Atualizar no banco
@@ -183,6 +289,11 @@ export async function GET(request: NextRequest) {
               freq_atual: freqAtual,
               freq_08_14: freq08_14,
               freq_15_21: freq15_21,
+              has_ficha: hasFicha,
+              ficha_vencida: fichaVencida,
+              workout_name: workoutName,
+              workout_id: workoutId,
+              workout_valid_until: workoutValidUntil,
               retention_score: retentionScore,
             })
             .eq('id', member.id);
@@ -194,7 +305,7 @@ export async function GET(request: NextRequest) {
           } else {
             result.status = 'updated';
             updated++;
-            console.log(`[ResyncAll] ✅ ${member.member_name}: ${result.before.freq_atual}→${freqAtual}, ${result.before.freq_08_14}→${freq08_14}`);
+            console.log(`[ResyncAll] ✅ ${member.member_name}: freq ${result.before.freq_atual}→${freqAtual}, ficha ${result.before.has_ficha}→${hasFicha}`);
           }
         } else {
           unchanged++;

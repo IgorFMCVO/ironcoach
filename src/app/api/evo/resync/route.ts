@@ -1,7 +1,12 @@
 // ============================================================================
+// CAMINHO: src/app/api/evo/resync/route.ts
+// ============================================================================
+
+// ============================================================================
 // IRON COACH - API para Re-sincronizar dados dos membros na fila
 // POST /api/evo/resync - Re-sincroniza todos os membros na fila
 // POST /api/evo/resync?id=X - Re-sincroniza um membro específico
+// INCLUI: Foto do membro (v13)
 // ============================================================================
 
 import { NextRequest, NextResponse } from 'next/server';
@@ -26,12 +31,15 @@ async function fetchMemberDataFromEvo(idMember: number) {
   
   let daysAsMember = 30;
   let isPersonal = false;
+  let photoUrl: string | null = null;
   
   const alerts = {
     semFicha: true,
     fichaVencida: false,
     semAvaliacao: true,
     avaliacaoVencida: false,
+    semMonitoramento: true,
+    monitoramentoVencido: false,
   };
   
   let workout: {
@@ -54,11 +62,18 @@ async function fetchMemberDataFromEvo(idMember: number) {
   };
 
   try {
-    // 1. Dados do membro
+    // 1. Dados do membro (API v2 para ter a foto)
     console.log(`[RESYNC] Buscando dados do membro ${idMember}...`);
-    const memberResp = await fetch(`${EVO_API}/api/v1/members/${idMember}`, { headers, cache: 'no-store' });
+    const memberResp = await fetch(`${EVO_API}/api/v2/members/${idMember}`, { headers, cache: 'no-store' });
     if (memberResp.ok) {
       const memberData = await memberResp.json();
+      
+      // Capturar URL da foto
+      if (memberData.photo) {
+        photoUrl = memberData.photo;
+        console.log(`[RESYNC] Foto encontrada para membro ${idMember}`);
+      }
+      
       const registerDate = memberData.registerDate || memberData.createdAt;
       if (registerDate) {
         daysAsMember = Math.max(0, Math.floor((Date.now() - new Date(registerDate).getTime()) / (1000 * 60 * 60 * 24)));
@@ -75,21 +90,29 @@ async function fetchMemberDataFromEvo(idMember: number) {
       console.error(`[RESYNC] Erro ao buscar membro ${idMember}: ${memberResp.status}`);
     }
 
-    // 2. Buscar SALES para verificar avaliações
+    // 2. Buscar SALES para verificar avaliações e monitoramento
     console.log(`[RESYNC] Buscando sales do membro ${idMember}...`);
     const salesResp = await fetch(`${EVO_API}/api/v1/sales?idMember=${idMember}&take=100`, { headers, cache: 'no-store' });
     if (salesResp.ok) {
       const salesData = await salesResp.json();
+      
+      // IDs e keywords para AVALIAÇÃO
       const avaliacaoServiceIds = [157, 158, 159, 160, 163, 164, 168, 169, 185, 186, 187, 188, 207, 208, 209, 210, 251, 252];
       const avaliacaoKeywords = ['AVALIA', 'BIOIMPEDÂNCIA', 'BIOIMPEDANCIA', 'REAVALIA'];
       
+      // Keywords para MONITORAMENTO
+      const monitoramentoKeywords = ['MONITORAMENTO', 'MONITORA', 'ACOMPANHAMENTO'];
+      
       let ultimaAvaliacaoDate: Date | null = null;
+      let ultimoMonitoramentoDate: Date | null = null;
       
       for (const sale of salesData) {
         const saleDate = sale.saleDate ? new Date(sale.saleDate) : null;
         for (const item of (sale.saleItens || [])) {
-          const isAvaliacaoById = avaliacaoServiceIds.includes(item.idService);
           const itemName = (item.item || item.description || '').toUpperCase();
+          
+          // Verificar AVALIAÇÃO
+          const isAvaliacaoById = avaliacaoServiceIds.includes(item.idService);
           const isAvaliacaoByName = avaliacaoKeywords.some(kw => itemName.includes(kw));
           
           if ((isAvaliacaoById || isAvaliacaoByName) && saleDate) {
@@ -97,9 +120,19 @@ async function fetchMemberDataFromEvo(idMember: number) {
               ultimaAvaliacaoDate = saleDate;
             }
           }
+          
+          // Verificar MONITORAMENTO
+          const isMonitoramentoByName = monitoramentoKeywords.some(kw => itemName.includes(kw));
+          
+          if (isMonitoramentoByName && saleDate) {
+            if (!ultimoMonitoramentoDate || saleDate > ultimoMonitoramentoDate) {
+              ultimoMonitoramentoDate = saleDate;
+            }
+          }
         }
       }
       
+      // Processar AVALIAÇÃO
       const VALIDADE_AVALIACAO_DIAS = 60;
       if (!ultimaAvaliacaoDate) {
         alerts.semAvaliacao = true;
@@ -108,6 +141,18 @@ async function fetchMemberDataFromEvo(idMember: number) {
         const diasDesdeAvaliacao = Math.floor((Date.now() - ultimaAvaliacaoDate.getTime()) / (1000 * 60 * 60 * 24));
         if (diasDesdeAvaliacao > VALIDADE_AVALIACAO_DIAS) {
           alerts.avaliacaoVencida = true;
+        }
+      }
+      
+      // Processar MONITORAMENTO (60 dias de validade)
+      const VALIDADE_MONITORAMENTO_DIAS = 60;
+      if (!ultimoMonitoramentoDate) {
+        alerts.semMonitoramento = true;
+      } else {
+        alerts.semMonitoramento = false;
+        const diasDesdeMonitoramento = Math.floor((Date.now() - ultimoMonitoramentoDate.getTime()) / (1000 * 60 * 60 * 24));
+        if (diasDesdeMonitoramento > VALIDADE_MONITORAMENTO_DIAS) {
+          alerts.monitoramentoVencido = true;
         }
       }
     }
@@ -154,8 +199,7 @@ async function fetchMemberDataFromEvo(idMember: number) {
     console.log(`[RESYNC] Buscando frequência do membro ${idMember}...`);
     
     // =========================================================================
-    // CORREÇÃO CRÍTICA: Usar timezone do Brasil (-03:00)
-    // O servidor roda em UTC, mas os dados do EVO são do Brasil
+    // CORREÇÃO CRÍTICA: Usar EXATAMENTE a mesma lógica do sync
     // =========================================================================
     const now = new Date();
     
@@ -169,22 +213,33 @@ async function fetchMemberDataFromEvo(idMember: number) {
     const dayOfWeek = nowBrazil.getDay();
     
     // Início da semana atual (domingo 00:00 no Brasil)
-    const startOfThisWeek = new Date(nowBrazil);
-    startOfThisWeek.setDate(nowBrazil.getDate() - dayOfWeek);
-    startOfThisWeek.setHours(0, 0, 0, 0);
+    const thisWeekStart = new Date(nowBrazil);
+    thisWeekStart.setDate(nowBrazil.getDate() - dayOfWeek);
+    thisWeekStart.setHours(0, 0, 0, 0);
     
-    // Início da semana passada
-    const startOfLastWeek = new Date(startOfThisWeek);
-    startOfLastWeek.setDate(startOfLastWeek.getDate() - 7);
+    // Fim da semana atual (sábado 23:59:59 no Brasil)
+    const thisWeekEnd = new Date(thisWeekStart);
+    thisWeekEnd.setDate(thisWeekStart.getDate() + 6);
+    thisWeekEnd.setHours(23, 59, 59, 999);
     
-    // Início de 2 semanas atrás
-    const startOf2WeeksAgo = new Date(startOfLastWeek);
-    startOf2WeeksAgo.setDate(startOf2WeeksAgo.getDate() - 7);
+    // SEMANA PASSADA
+    const lastWeekStart = new Date(thisWeekStart);
+    lastWeekStart.setDate(lastWeekStart.getDate() - 7);
+    const lastWeekEnd = new Date(lastWeekStart);
+    lastWeekEnd.setDate(lastWeekEnd.getDate() + 6);
+    lastWeekEnd.setHours(23, 59, 59, 999);
+    
+    // 2 SEMANAS ATRÁS
+    const twoWeeksAgoStart = new Date(thisWeekStart);
+    twoWeeksAgoStart.setDate(twoWeeksAgoStart.getDate() - 14);
+    const twoWeeksAgoEnd = new Date(twoWeeksAgoStart);
+    twoWeeksAgoEnd.setDate(twoWeeksAgoEnd.getDate() + 6);
+    twoWeeksAgoEnd.setHours(23, 59, 59, 999);
     
     console.log(`[RESYNC] Semanas calculadas (Brasil):`);
-    console.log(`  Esta semana: a partir de ${startOfThisWeek.toISOString().split('T')[0]}`);
-    console.log(`  Sem passada: a partir de ${startOfLastWeek.toISOString().split('T')[0]}`);
-    console.log(`  2 sem atrás: a partir de ${startOf2WeeksAgo.toISOString().split('T')[0]}`);
+    console.log(`  Esta semana: ${thisWeekStart.toISOString().split('T')[0]} (Dom) a ${thisWeekEnd.toISOString().split('T')[0]} (Sáb)`);
+    console.log(`  Sem passada: ${lastWeekStart.toISOString().split('T')[0]} (Dom) a ${lastWeekEnd.toISOString().split('T')[0]} (Sáb)`);
+    console.log(`  2 sem atrás: ${twoWeeksAgoStart.toISOString().split('T')[0]} (Dom) a ${twoWeeksAgoEnd.toISOString().split('T')[0]} (Sáb)`);
 
     // Buscar 30 dias de entradas
     const date30DaysAgo = new Date(nowBrazil.getTime() - 30 * 24 * 60 * 60 * 1000);
@@ -207,9 +262,9 @@ async function fetchMemberDataFromEvo(idMember: number) {
       console.log(`[RESYNC] Membro ${idMember}: ${entries.length} entries brutas`);
       
       // Usar Set para contar apenas 1 presença por dia
-      const diasSemanaAtual = new Set<string>();
-      const diasSemanaPassada = new Set<string>();
-      const dias2SemanasAtras = new Set<string>();
+      const daysThisWeek = new Set<string>();
+      const daysLastWeek = new Set<string>();
+      const daysTwoWeeksAgo = new Set<string>();
       
       for (const entry of entries) {
         // CORREÇÃO: Aceitar TODAS as entradas que têm data
@@ -245,21 +300,23 @@ async function fetchMemberDataFromEvo(idMember: number) {
         }
         
         // Extrair apenas a data (YYYY-MM-DD) da string original
-        const diaKey = entry.date.split('T')[0];
+        const dayKey = entry.date.split('T')[0];
+        const entryTime = entryDate.getTime();
         
-        if (entryDate >= startOfThisWeek) {
-          diasSemanaAtual.add(diaKey);
-        } else if (entryDate >= startOfLastWeek) {
-          diasSemanaPassada.add(diaKey);
-        } else if (entryDate >= startOf2WeeksAgo) {
-          dias2SemanasAtras.add(diaKey);
+        // CORREÇÃO: Usar getTime() para comparação precisa de timestamps
+        if (entryTime >= thisWeekStart.getTime() && entryTime <= thisWeekEnd.getTime()) {
+          daysThisWeek.add(dayKey);
+        } else if (entryTime >= lastWeekStart.getTime() && entryTime <= lastWeekEnd.getTime()) {
+          daysLastWeek.add(dayKey);
+        } else if (entryTime >= twoWeeksAgoStart.getTime() && entryTime <= twoWeeksAgoEnd.getTime()) {
+          daysTwoWeeksAgo.add(dayKey);
         }
       }
       
       // Frequência = número de DIAS únicos, não número de entradas
-      churnData.freqAtual = diasSemanaAtual.size;
-      churnData.freq08_14 = diasSemanaPassada.size;
-      churnData.freq15_21 = dias2SemanasAtras.size;
+      churnData.freqAtual = daysThisWeek.size;
+      churnData.freq08_14 = daysLastWeek.size;
+      churnData.freq15_21 = daysTwoWeeksAgo.size;
       
       console.log(`[RESYNC] Membro ${idMember}: freqAtual=${churnData.freqAtual}, freq08_14=${churnData.freq08_14}, freq15_21=${churnData.freq15_21} (dias únicos)`);
       
@@ -334,6 +391,7 @@ async function fetchMemberDataFromEvo(idMember: number) {
         workout,
         churnData,
         retentionScore,
+        photoUrl,
       }
     };
   } catch (error) {
@@ -426,6 +484,7 @@ export async function POST(request: NextRequest) {
           tags: d.tags,
           days_as_member: d.daysAsMember,
           is_personal: d.isPersonal,
+          member_photo_url: d.photoUrl,
           workout_name: d.workout?.nomeTreino || null,
           workout_letter: d.workout?.serieAtual || null,
           workout_id: d.workout?.idTreino || null,
@@ -436,6 +495,8 @@ export async function POST(request: NextRequest) {
           has_avaliacao: !d.alerts.semAvaliacao,
           ficha_vencida: d.alerts.fichaVencida,
           avaliacao_vencida: d.alerts.avaliacaoVencida,
+          has_monitoramento: !d.alerts.semMonitoramento,
+          monitoramento_vencido: d.alerts.monitoramentoVencido,
           retention_score: d.retentionScore,
           churn_level: d.churnData.level,
           freq_esperada: d.churnData.frequenciaEsperada,

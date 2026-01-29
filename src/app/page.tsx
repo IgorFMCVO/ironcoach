@@ -88,6 +88,18 @@ import {
   getSuggestion,
   getPhaseLabel,
   type Suggestion,
+  // Sistema de Alertas de Ambiente
+  type NivelAtendimento,
+  type EnvironmentConfig,
+  type EnvironmentStatus,
+  DEFAULT_ENVIRONMENT_CONFIG,
+  NIVEL_CONFIG,
+  calcularNivelCapacidade,
+  calcularNivelFila,
+  getPiorNivel,
+  calcularTemposAjustados,
+  getAlertaFrequencia,
+  getAlertaDuracao,
 } from '@/lib/constants';
 
 // ============================================================================
@@ -107,7 +119,7 @@ interface QueueMember {
   id: string;
   name: string;
   evoMemberId: number | null; // ID do membro no EVO
-  status: 'WAITING' | 'TRAINING' | 'BEING_ATTENDED' | 'IDLE';
+  status: 'WAITING' | 'TRAINING' | 'BEING_ATTENDED' | 'IDLE' | 'DOING_CARDIO' | 'FINISHED';
   priority: Priority;
   checkInTime: string;
   lastAttendedAt: string | null;
@@ -132,6 +144,9 @@ interface QueueMember {
   hasAvaliacao: boolean;
   fichaVencida: boolean;
   avaliacaoVencida: boolean;
+  // Monitoramento
+  hasMonitoramento: boolean;
+  monitoramentoVencido: boolean;
   // FASE 1: Pular Atendimento
   skipCount: number;
   // Foto do membro
@@ -230,6 +245,8 @@ function dbToLocal(db: DBQueueMember): QueueMember {
   const fichaVencida = (db as any).ficha_vencida || false;
   const hasAvaliacao = (db as any).has_avaliacao ?? false;
   const avaliacaoVencida = (db as any).avaliacao_vencida || false;
+  const hasMonitoramento = (db as any).has_monitoramento ?? false;
+  const monitoramentoVencido = (db as any).monitoramento_vencido || false;
   
   // CORREÇÃO: Usar retention_score do BANCO quando disponível
   // Só recalcular se não existir no banco
@@ -281,6 +298,8 @@ function dbToLocal(db: DBQueueMember): QueueMember {
     hasAvaliacao,
     fichaVencida,
     avaliacaoVencida,
+    hasMonitoramento,
+    monitoramentoVencido,
     // FASE 1: Pular Atendimento
     skipCount: (db as any).skip_count || 0,
     // Foto do membro
@@ -389,6 +408,32 @@ export default function Dashboard() {
   const [onlineUsers, setOnlineUsers] = useState<OnlineUsersData>({ coaches: [], consultoras: [], totalOnline: 0 });
   const [showOnlineUsersPanel, setShowOnlineUsersPanel] = useState(false);
   
+  // SISTEMA DE ALERTAS DE AMBIENTE
+  const [envConfig, setEnvConfig] = useState<EnvironmentConfig>(DEFAULT_ENVIRONMENT_CONFIG);
+  const [envStatus, setEnvStatus] = useState<EnvironmentStatus>({
+    nivel: 'OTIMO',
+    nivelCapacidade: 'OTIMO',
+    nivelFila: 'OTIMO',
+    alunosAtivos: 0,
+    professoresOnline: 0,
+    ratio: 0,
+    cardsEsperandoOtimo: 0,
+    cardsEsperandoBom: 0,
+    cardsEsperandoBaixo: 0,
+    cardsEsperandoCritico: 0,
+    tempoVermelho: 210,
+    tempoLaranja: 270,
+    tempoAmarelo: 330,
+    tempoVerde: 390,
+    ultimoAlerta: null,
+    proximoAlerta: null,
+  });
+  const [showEnvAlert, setShowEnvAlert] = useState(false);
+  const [coachesOnFloor, setCoachesOnFloor] = useState<{ coachId: string; coachName: string; role: string; since: string }[]>([]);
+  const [isCoachOnFloor, setIsCoachOnFloor] = useState(false);
+  const lastEnvAlertRef = useRef<Date | null>(null);
+  const envAlertSoundPlayedRef = useRef(false);
+  
   const { playSound, playAlert } = useAudio();
   const { vibrateSuccess } = useVibration();
   
@@ -421,6 +466,221 @@ export default function Dashboard() {
     const interval = setInterval(loadPendingCount, 30000); // A cada 30 segundos
     return () => clearInterval(interval);
   }, [coach?.is_supervisor]);
+
+  // ============================================================================
+  // SISTEMA DE ALERTAS DE AMBIENTE - HOOKS
+  // ============================================================================
+  
+  // Carregar configuração de ambiente e status dos coaches
+  useEffect(() => {
+    if (!coach) return;
+    
+    const loadEnvironmentData = async () => {
+      try {
+        const response = await fetch('/api/environment');
+        if (response.ok) {
+          const data = await response.json();
+          if (data.config && Object.keys(data.config).length > 0) {
+            setEnvConfig(data.config);
+          }
+          setCoachesOnFloor(data.coaches || []);
+          
+          // Verificar se este coach está no salão
+          const thisCoachOnFloor = data.allCoaches?.find(
+            (c: any) => c.coach_id === coach.id && c.is_on_floor
+          );
+          setIsCoachOnFloor(!!thisCoachOnFloor);
+        }
+      } catch (error) {
+        console.error('Erro ao carregar dados de ambiente:', error);
+      }
+    };
+    
+    loadEnvironmentData();
+    const interval = setInterval(loadEnvironmentData, 30000); // A cada 30 segundos
+    return () => clearInterval(interval);
+  }, [coach]);
+  
+  // Calcular status do ambiente a cada 10 segundos
+  useEffect(() => {
+    if (!coach) return;
+    
+    const calculateEnvironmentStatus = () => {
+      // Filtrar alunos ativos (excluir cardio, personal, autônomos)
+      const alunosAtivos = queue.filter(m => 
+        m.status !== 'DOING_CARDIO' &&
+        m.status !== 'FINISHED' &&
+        m.priority !== 'BLUE' &&
+        m.priority !== 'BLACK' &&
+        !m.isPersonal &&
+        !m.tags.includes('PERSONAL') &&
+        !m.tags.includes('CONSULTORIA')
+      ).length;
+      
+      // Contar professores no salão
+      // coachesOnFloor já contém apenas quem está no salão:
+      // - PROFESSOR: entra automaticamente ao fazer login
+      // - SUPERVISOR: só entra quando clica no botão "Reforço"
+      const professoresOnline = coachesOnFloor.length || 1; // Mínimo 1 para evitar divisão por zero
+      
+      // Calcular ratio
+      const ratio = alunosAtivos / professoresOnline;
+      
+      // Calcular nível de capacidade
+      const nivelCapacidade = calcularNivelCapacidade(ratio, envConfig);
+      
+      // Contar cards por tempo de espera
+      const now = Date.now();
+      let cardsOtimo = 0, cardsBom = 0, cardsBaixo = 0, cardsCritico = 0;
+      
+      queue.forEach(m => {
+        if (m.status === 'DOING_CARDIO' || m.status === 'FINISHED') return;
+        if (m.priority === 'BLUE' || m.priority === 'BLACK') return;
+        if (m.isPersonal || m.tags.includes('PERSONAL') || m.tags.includes('CONSULTORIA')) return;
+        
+        const waitTime = (now - new Date(m.checkInTime).getTime()) / 1000;
+        
+        if (waitTime > envConfig.tempoFilaCritico) cardsCritico++;
+        else if (waitTime > envConfig.tempoFilaBaixo) cardsBaixo++;
+        else if (waitTime > envConfig.tempoFilaBom) cardsBom++;
+        else if (waitTime > envConfig.tempoFilaOtimo) cardsOtimo++;
+      });
+      
+      // Calcular nível de fila
+      const nivelFila = calcularNivelFila(cardsOtimo, cardsBom, cardsBaixo, cardsCritico, envConfig);
+      
+      // Pior nível entre os dois
+      const nivel = getPiorNivel(nivelCapacidade, nivelFila);
+      
+      // Calcular tempos ajustados
+      const temposAjustados = calcularTemposAjustados(nivel, envConfig);
+      
+      // Verificar se é hora de mostrar alerta
+      const agora = new Date();
+      const freqMinutos = getAlertaFrequencia(nivel, envConfig);
+      let proximoAlerta: Date | null = null;
+      
+      if (lastEnvAlertRef.current) {
+        proximoAlerta = new Date(lastEnvAlertRef.current.getTime() + freqMinutos * 60 * 1000);
+        
+        if (agora >= proximoAlerta) {
+          // Hora de mostrar alerta!
+          setShowEnvAlert(true);
+          lastEnvAlertRef.current = agora;
+          
+          // Tocar som se não estiver mudo
+          if (!isMuted && !envAlertSoundPlayedRef.current) {
+            playAlert();
+            envAlertSoundPlayedRef.current = true;
+            setTimeout(() => { envAlertSoundPlayedRef.current = false; }, 5000);
+          }
+          
+          // Esconder após a duração configurada
+          const duracao = getAlertaDuracao(nivel, envConfig);
+          setTimeout(() => setShowEnvAlert(false), duracao * 1000);
+          
+          // Registrar no histórico
+          fetch('/api/environment', {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              nivel,
+              alunosAtivos,
+              professoresOnline,
+              ratio,
+              cardsOtimo,
+              cardsBom,
+              cardsBaixo,
+              cardsCritico,
+              tempoVermelho: temposAjustados.vermelho,
+              tempoLaranja: temposAjustados.laranja,
+              tempoAmarelo: temposAjustados.amarelo,
+              tempoVerde: temposAjustados.verde,
+              alertaTipo: nivel === 'CRITICO' ? 'BOTH' : 'FULLSCREEN'
+            })
+          }).catch(console.error);
+          
+          // Enviar notificação WhatsApp se nível CRÍTICO
+          if (nivel === 'CRITICO' && envConfig.supervisorWhatsapp) {
+            fetch('/api/notifications/whatsapp', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                phone: envConfig.supervisorWhatsapp,
+                message: `🚨 *ALERTA CRÍTICO - IRON COACH*\n\n` +
+                  `⚠️ REFORÇO NECESSÁRIO!\n\n` +
+                  `👥 Alunos: ${alunosAtivos}\n` +
+                  `👨‍🏫 Professores: ${professoresOnline}\n` +
+                  `📊 Ratio: ${ratio.toFixed(1)}:1\n\n` +
+                  `🔴 ${cardsCritico} cards aguardando > 5 min\n\n` +
+                  `Acesse o dashboard para mais detalhes.`
+              })
+            }).catch(console.error);
+          }
+          
+          proximoAlerta = new Date(agora.getTime() + freqMinutos * 60 * 1000);
+        }
+      } else {
+        // Primeiro alerta
+        lastEnvAlertRef.current = agora;
+        proximoAlerta = new Date(agora.getTime() + freqMinutos * 60 * 1000);
+      }
+      
+      setEnvStatus({
+        nivel,
+        nivelCapacidade,
+        nivelFila,
+        alunosAtivos,
+        professoresOnline,
+        ratio,
+        cardsEsperandoOtimo: cardsOtimo,
+        cardsEsperandoBom: cardsBom,
+        cardsEsperandoBaixo: cardsBaixo,
+        cardsEsperandoCritico: cardsCritico,
+        tempoVermelho: temposAjustados.vermelho,
+        tempoLaranja: temposAjustados.laranja,
+        tempoAmarelo: temposAjustados.amarelo,
+        tempoVerde: temposAjustados.verde,
+        ultimoAlerta: lastEnvAlertRef.current,
+        proximoAlerta,
+      });
+    };
+    
+    calculateEnvironmentStatus();
+    const interval = setInterval(calculateEnvironmentStatus, 10000); // A cada 10 segundos
+    return () => clearInterval(interval);
+  }, [coach, queue, coachesOnFloor, envConfig, isMuted, playAlert]);
+  
+  // Função para entrar/sair do salão (para supervisores)
+  const toggleCoachOnFloor = async () => {
+    if (!coach) return;
+    
+    try {
+      const response = await fetch('/api/environment', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          coachId: coach.id,
+          coachName: coach.name,
+          role: coach.is_supervisor ? 'SUPERVISOR' : 'PROFESSOR',
+          isOnFloor: !isCoachOnFloor
+        })
+      });
+      
+      if (response.ok) {
+        setIsCoachOnFloor(!isCoachOnFloor);
+        
+        // Atualizar lista de coaches
+        const envResponse = await fetch('/api/environment');
+        if (envResponse.ok) {
+          const data = await envResponse.json();
+          setCoachesOnFloor(data.coaches || []);
+        }
+      }
+    } catch (error) {
+      console.error('Erro ao atualizar status no salão:', error);
+    }
+  };
 
   const { recentEntries, lastSyncTime, isLoading: isSyncing, triggerSync } = useEvoSync({
     enabled: !!coach,
@@ -661,10 +921,17 @@ export default function Dashboard() {
     if (!coach) return;
     
     // Carregar membros em cardio inicialmente
-    getCardioMembers().then(setCardioMembers);
+    console.log('🏃 Carregando membros em cardio...');
+    getCardioMembers().then(members => {
+      console.log('🏃 Membros em cardio carregados:', members.length, members);
+      setCardioMembers(members);
+    }).catch(err => {
+      console.error('🏃 Erro ao carregar membros em cardio:', err);
+    });
     
     // Subscrever para atualizações
     const unsub = subscribeToCardioMembers((members) => {
+      console.log('🏃 Atualização de membros em cardio (subscription):', members.length, members);
       setCardioMembers(members);
     });
     
@@ -732,9 +999,46 @@ export default function Dashboard() {
     // Buscar coaches ativos
     const coaches = await getActiveCoaches();
     setActiveCoaches(coaches);
+    
+    // ALERTAS DE AMBIENTE: Registrar professor no floor (não supervisores)
+    // Supervisores só entram no floor quando clicam no botão "Reforço"
+    if (c.role !== 'SUPERVISOR' && c.role !== 'ADMIN') {
+      try {
+        await fetch('/api/environment', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            coachId: c.id,
+            coachName: c.name,
+            role: c.role || 'PROFESSOR',
+            isOnFloor: true
+          })
+        });
+      } catch (err) {
+        console.error('Erro ao registrar no floor:', err);
+      }
+    }
   };
 
   const handleLogout = async () => {
+    // ALERTAS DE AMBIENTE: Remover do floor
+    if (coach) {
+      try {
+        await fetch('/api/environment', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            coachId: coach.id,
+            coachName: coach.name,
+            role: coach.role || 'PROFESSOR',
+            isOnFloor: false
+          })
+        });
+      } catch (err) {
+        console.error('Erro ao remover do floor:', err);
+      }
+    }
+    
     // MULTI-PROFESSOR: Encerrar sessão do coach
     if (coach) {
       await endCoachSession(coach.id);
@@ -913,6 +1217,14 @@ export default function Dashboard() {
   const handleStartCardio = async () => {
     if (!activeAttendance || !coach) return;
     
+    console.log('🏃 Iniciando cardio...', {
+      memberId: activeAttendance.member.id,
+      memberName: activeAttendance.member.name,
+      coachId: coach.id,
+      duration: cardioConfig.duration,
+      destination: cardioConfig.destination,
+    });
+    
     const result = await startMemberCardio(
       activeAttendance.member.id,
       coach.id,
@@ -920,6 +1232,8 @@ export default function Dashboard() {
       cardioConfig.duration,
       cardioConfig.destination
     );
+    
+    console.log('🏃 Resultado do cardio:', result);
     
     if (result.success) {
       // Fechar modais
@@ -937,9 +1251,16 @@ export default function Dashboard() {
       
       // Recarregar dados
       loadQueue();
-      getCardioMembers().then(setCardioMembers);
+      getCardioMembers().then(members => {
+        console.log('🏃 Membros em cardio após iniciar:', members);
+        setCardioMembers(members);
+      });
       
       console.log(`🏃 Cardio iniciado: ${activeAttendance.member.name} - ${cardioConfig.duration}min - ${cardioConfig.destination === 'QUEUE' ? 'Volta para fila' : 'Finaliza treino'}`);
+    } else {
+      // ERRO - mostrar alerta para o usuário
+      console.error('❌ Erro ao iniciar cardio:', result.error);
+      alert(`Erro ao iniciar cardio: ${result.error || 'Erro desconhecido'}\n\nVerifique se o sistema de cardio está configurado no banco de dados.`);
     }
   };
 
@@ -1135,11 +1456,14 @@ export default function Dashboard() {
   // Separar fila: Regular vs Personal/Autônomo
   // Personal = isPersonal true OU tem tag PERSONAL/CONSULTORIA
   // NÃO incluir apenas por prioridade BLUE (veterano autônomo vai para fila regular)
-  const regularQueue = queue.filter(m => {
+  // Filtrar membros em cardio (eles aparecem em seção separada)
+  const activeQueue = queue.filter(m => m.status !== 'DOING_CARDIO' && m.status !== 'FINISHED');
+  
+  const regularQueue = activeQueue.filter(m => {
     const hasPersonalTag = m.tags?.includes('PERSONAL') || m.tags?.includes('CONSULTORIA');
     return !m.isPersonal && !hasPersonalTag;
   });
-  const personalQueue = queue.filter(m => {
+  const personalQueue = activeQueue.filter(m => {
     const hasPersonalTag = m.tags?.includes('PERSONAL') || m.tags?.includes('CONSULTORIA');
     return m.isPersonal || hasPersonalTag;
   });
@@ -1147,46 +1471,46 @@ export default function Dashboard() {
   return (
     <div className="h-screen h-[100dvh] w-screen bg-[#0a0a0a] text-white flex flex-col overflow-hidden">
       {/* HEADER */}
-      <header className="shrink-0 h-14 px-4 flex items-center justify-between border-b border-white/10 bg-black/50">
+      <header className="shrink-0 min-h-14 px-2 sm:px-4 py-2 flex items-center justify-between border-b border-white/10 bg-black/50 flex-wrap gap-2">
         {/* ESQUERDA - Logo + Nome */}
-        <div className="flex items-center gap-3">
-          <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-[#FF3B30] to-[#FF6347] flex items-center justify-center font-black text-lg">I</div>
-          <div>
+        <div className="flex items-center gap-2 sm:gap-3">
+          <div className="w-8 h-8 sm:w-9 sm:h-9 rounded-xl bg-gradient-to-br from-[#FF3B30] to-[#FF6347] flex items-center justify-center font-black text-base sm:text-lg">I</div>
+          <div className="hidden xs:block">
             <h1 className="text-sm font-black">IRON<span className="text-[#FF3B30]">COACH</span></h1>
-            <p className="text-[10px] text-white/30">v15 • Sistema de Atendimento</p>
+            <p className="text-[10px] text-white/30 hidden sm:block">v15 • Sistema de Atendimento</p>
           </div>
         </div>
 
         {/* CENTRO - Navegação + Entrada Manual */}
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1 sm:gap-2 order-3 sm:order-2 w-full sm:w-auto justify-center sm:justify-start">
           {/* BOTÃO ENTRADA MANUAL */}
           <button 
             onClick={() => setShowManualEntry(true)}
-            className="px-3 py-1.5 bg-gradient-to-r from-green-500/20 to-emerald-500/20 hover:from-green-500/30 hover:to-emerald-500/30 border border-green-500/30 rounded-lg text-xs transition-all text-green-400 flex items-center gap-2"
+            className="px-2 sm:px-3 py-1.5 bg-gradient-to-r from-green-500/20 to-emerald-500/20 hover:from-green-500/30 hover:to-emerald-500/30 border border-green-500/30 rounded-lg text-xs transition-all text-green-400 flex items-center gap-1 sm:gap-2"
             title="Adicionar aluno manualmente"
           >
             <AddUserIcon size={14} />
-            <span className="hidden sm:inline">Inserir Aluno</span>
+            <span className="hidden md:inline">Inserir Aluno</span>
           </button>
           
-          <div className="w-px h-6 bg-white/10" />
+          <div className="w-px h-6 bg-white/10 hidden sm:block" />
           
           <Link 
             href="/prioridades" 
-            className="px-3 py-1.5 bg-white/5 hover:bg-white/10 rounded-lg text-xs transition-all flex items-center gap-2"
+            className="px-2 sm:px-3 py-1.5 bg-white/5 hover:bg-white/10 rounded-lg text-xs transition-all flex items-center gap-1 sm:gap-2"
           >
             <GuideIcon size={14} />
-            <span className="hidden sm:inline">Guia</span>
+            <span className="hidden lg:inline">Guia</span>
           </Link>
           {coach.is_supervisor && (
             <Link 
               href="/supervisao"
-              className="relative px-3 py-1.5 bg-blue-500/20 hover:bg-blue-500/30 rounded-lg text-xs transition-all text-blue-400 flex items-center gap-2"
+              className="relative px-2 sm:px-3 py-1.5 bg-blue-500/20 hover:bg-blue-500/30 rounded-lg text-xs transition-all text-blue-400 flex items-center gap-1 sm:gap-2"
             >
               <SupervisorIcon size={14} />
-              <span className="hidden sm:inline">Supervisão</span>
+              <span className="hidden lg:inline">Supervisão</span>
               {pendingRequestsCount > 0 && (
-                <span className="absolute -top-1 -right-1 w-5 h-5 bg-red-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center animate-pulse">
+                <span className="absolute -top-1 -right-1 w-4 h-4 sm:w-5 sm:h-5 bg-red-500 text-white text-[8px] sm:text-[10px] font-bold rounded-full flex items-center justify-center animate-pulse">
                   {pendingRequestsCount > 9 ? '9+' : pendingRequestsCount}
                 </span>
               )}
@@ -1195,72 +1519,73 @@ export default function Dashboard() {
           {(coach.is_supervisor || coach.role === 'ADMIN') && (
             <Link 
               href="/consultoras"
-              className="px-3 py-1.5 bg-amber-500/20 hover:bg-amber-500/30 rounded-lg text-xs transition-all text-amber-400 flex items-center gap-2"
+              className="px-2 sm:px-3 py-1.5 bg-amber-500/20 hover:bg-amber-500/30 rounded-lg text-xs transition-all text-amber-400 flex items-center gap-1 sm:gap-2"
             >
               <span>📋</span>
-              <span className="hidden sm:inline">Consultoras</span>
+              <span className="hidden xl:inline">Consultoras</span>
             </Link>
           )}
           {coach.role === 'ADMIN' && (
             <>
               <Link 
                 href="/admin"
-                className="px-3 py-1.5 bg-purple-500/20 hover:bg-purple-500/30 rounded-lg text-xs transition-all text-purple-400 flex items-center gap-2"
+                className="px-2 sm:px-3 py-1.5 bg-purple-500/20 hover:bg-purple-500/30 rounded-lg text-xs transition-all text-purple-400 flex items-center gap-1 sm:gap-2"
               >
                 <AdminIcon size={14} />
-                <span className="hidden sm:inline">Admin</span>
+                <span className="hidden xl:inline">Admin</span>
               </Link>
               <Link 
                 href="/logs"
-                className="px-3 py-1.5 bg-red-500/20 hover:bg-red-500/30 rounded-lg text-xs transition-all text-red-400 flex items-center gap-2"
+                className="hidden sm:flex px-2 sm:px-3 py-1.5 bg-red-500/20 hover:bg-red-500/30 rounded-lg text-xs transition-all text-red-400 items-center gap-1 sm:gap-2"
               >
                 <span>📋</span>
-                <span className="hidden sm:inline">Logs</span>
+                <span className="hidden xl:inline">Logs</span>
               </Link>
               <Link 
                 href="/relatorios"
-                className="px-3 py-1.5 bg-emerald-500/20 hover:bg-emerald-500/30 rounded-lg text-xs transition-all text-emerald-400 flex items-center gap-2"
+                className="hidden sm:flex px-2 sm:px-3 py-1.5 bg-emerald-500/20 hover:bg-emerald-500/30 rounded-lg text-xs transition-all text-emerald-400 items-center gap-1 sm:gap-2"
               >
                 <span>📊</span>
-                <span className="hidden sm:inline">Relatórios</span>
+                <span className="hidden xl:inline">Relatórios</span>
               </Link>
             </>
           )}
         </div>
 
         {/* CENTRO-DIREITA - Hora */}
-        <p className="text-3xl font-light tabular-nums">
+        <p className="text-xl sm:text-3xl font-light tabular-nums order-2 sm:order-3">
           {time.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}
         </p>
 
         {/* DIREITA - Stats + Filtro + User */}
-        <div className="flex items-center gap-3">
-          <div className="flex items-center gap-4 text-center">
-            <div className="flex items-center gap-2">
-              <DumbbellIcon size={16} color="rgba(255,255,255,0.3)" />
+        <div className="flex items-center gap-1 sm:gap-3 order-4">
+          {/* Stats - esconder em telas pequenas */}
+          <div className="hidden md:flex items-center gap-2 lg:gap-4 text-center">
+            <div className="flex items-center gap-1 lg:gap-2">
+              <DumbbellIcon size={14} color="rgba(255,255,255,0.3)" />
               <div>
-                <p className="text-lg font-bold">{stats.total}</p>
-                <p className="text-[10px] text-white/30">Intervenções</p>
+                <p className="text-sm lg:text-lg font-bold">{stats.total}</p>
+                <p className="text-[8px] lg:text-[10px] text-white/30">Intervenções</p>
               </div>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="hidden lg:flex items-center gap-2">
               <TimerIcon size={16} color="rgba(255,255,255,0.3)" />
               <div>
                 <p className="text-lg font-bold">{stats.avgTime.toFixed(0)}s</p>
                 <p className="text-[10px] text-white/30">Média</p>
               </div>
             </div>
-            <div className="flex items-center gap-2">
-              <TrophyIcon size={16} />
+            <div className="flex items-center gap-1 lg:gap-2">
+              <TrophyIcon size={14} />
               <div>
-                <p className="text-lg font-bold text-[#FFD700]">{stats.xp}</p>
-                <p className="text-[10px] text-white/30">XP</p>
+                <p className="text-sm lg:text-lg font-bold text-[#FFD700]">{stats.xp}</p>
+                <p className="text-[8px] lg:text-[10px] text-white/30">XP</p>
               </div>
             </div>
           </div>
-          <div className="w-px h-8 bg-white/10" />
+          <div className="w-px h-8 bg-white/10 hidden md:block" />
           
-          {/* USUÁRIOS ONLINE - Clique para ver detalhes */}
+          {/* USUÁRIOS ONLINE - Simplificado em mobile */}
           <button
             onClick={() => setShowOnlineUsersPanel(!showOnlineUsersPanel)}
             className={`flex items-center gap-1 px-2 py-1 rounded-lg transition-all ${
@@ -1271,8 +1596,8 @@ export default function Dashboard() {
             title="Ver usuários online"
           >
             <span className="text-green-400 text-sm">👥</span>
-            <span className="text-green-400 text-xs font-medium">{onlineUsers.totalOnline || activeCoaches.length} online</span>
-            <div className="flex -space-x-1 ml-1">
+            <span className="text-green-400 text-xs font-medium hidden sm:inline">{onlineUsers.totalOnline || activeCoaches.length}</span>
+            <div className="hidden sm:flex -space-x-1 ml-1">
               {/* Usar onlineUsers se disponível, senão activeCoaches */}
               {onlineUsers.coaches.length > 0 ? (
                 <>
@@ -1318,33 +1643,73 @@ export default function Dashboard() {
             </div>
           </button>
           
+          {/* INDICADOR DE AMBIENTE */}
+          <div 
+            className="flex items-center gap-2 px-2 py-1 rounded-lg cursor-pointer transition-all"
+            style={{
+              background: NIVEL_CONFIG[envStatus.nivel].bgColor,
+              border: `1px solid ${NIVEL_CONFIG[envStatus.nivel].borderColor}`,
+            }}
+            title={`${NIVEL_CONFIG[envStatus.nivel].label}: ${envStatus.alunosAtivos} alunos / ${envStatus.professoresOnline} prof (${envStatus.ratio.toFixed(1)}:1)`}
+          >
+            <span className="text-sm">{NIVEL_CONFIG[envStatus.nivel].emoji}</span>
+            <div className="hidden lg:flex flex-col">
+              <span className="text-[10px] font-bold" style={{ color: NIVEL_CONFIG[envStatus.nivel].color }}>
+                {NIVEL_CONFIG[envStatus.nivel].label}
+              </span>
+              <span className="text-[8px] text-white/50">
+                {envStatus.ratio.toFixed(1)}:1
+              </span>
+            </div>
+            <div className="hidden xl:flex items-center gap-1 text-[9px] text-white/40">
+              <span>👥{envStatus.alunosAtivos}</span>
+              <span>👨‍🏫{envStatus.professoresOnline}</span>
+            </div>
+          </div>
+          
+          {/* BOTÃO REFORÇO (apenas para supervisores) */}
+          {coach.is_supervisor && (
+            <button
+              onClick={toggleCoachOnFloor}
+              className={`px-2 py-1 rounded-lg text-xs font-bold transition-all flex items-center gap-1 ${
+                isCoachOnFloor
+                  ? 'bg-green-500/30 border border-green-500/50 text-green-400'
+                  : 'bg-blue-500/20 border border-blue-500/30 text-blue-400 hover:bg-blue-500/30'
+              }`}
+              title={isCoachOnFloor ? 'Sair do salão (reforço)' : 'Entrar no salão como reforço'}
+            >
+              {isCoachOnFloor ? '✅ No Salão' : '🏃 Reforço'}
+            </button>
+          )}
+          
           {/* BOTÃO FILTRO PRIORIDADES MÁXIMAS */}
           <button 
             onClick={() => setShowPriorityFilter(!showPriorityFilter)} 
-            className={`px-3 py-2 rounded-lg font-bold text-sm flex items-center gap-2 transition-all ${
+            className={`px-2 sm:px-3 py-1.5 sm:py-2 rounded-lg font-bold text-xs sm:text-sm flex items-center gap-1 sm:gap-2 transition-all ${
               showPriorityFilter 
                 ? 'bg-[#FF3B30] text-white shadow-lg shadow-red-500/30' 
                 : 'bg-[#FF3B30]/20 text-[#FF3B30] hover:bg-[#FF3B30]/30'
             }`}
             title={showPriorityFilter ? 'Mostrar todos' : 'Filtrar 1ª/2ª Semana'}
           >
-            {showPriorityFilter ? '✕' : '●'} 1ª/2ª
+            {showPriorityFilter ? '✕' : '●'} <span className="hidden sm:inline">1ª/2ª</span>
           </button>
-          <button onClick={toggleMute} className={`p-2 rounded-lg transition-colors ${isMuted ? 'bg-red-500/20 text-red-400' : 'hover:bg-white/5 text-white/40'}`}>
+          <button onClick={toggleMute} className={`p-1.5 sm:p-2 rounded-lg transition-colors ${isMuted ? 'bg-red-500/20 text-red-400' : 'hover:bg-white/5 text-white/40'}`}>
             {isMuted ? '🔇' : '🔊'}
           </button>
           
           {/* MULTI-PROFESSOR: Botão de pausar */}
           <button
             onClick={() => setShowPauseModal(true)}
-            className="p-2 rounded-lg hover:bg-yellow-500/20 text-yellow-400/60 hover:text-yellow-400 transition-colors"
+            className="p-1.5 sm:p-2 rounded-lg hover:bg-yellow-500/20 text-yellow-400/60 hover:text-yellow-400 transition-colors"
             title="Pausar (lanche, banheiro...)"
           >
             ⏸️
           </button>
           
-          <button onClick={handleLogout} className="flex items-center gap-2 hover:bg-white/5 rounded-lg px-2 py-1" title="Sair">
-            <div className="w-8 h-8 rounded-full bg-[#FF3B30]/20 flex items-center justify-center text-xs font-bold text-[#FF3B30]">{coach.initials}</div>
+          {/* BOTÃO LOGOUT - SEMPRE VISÍVEL */}
+          <button onClick={handleLogout} className="flex items-center gap-1 sm:gap-2 hover:bg-white/5 rounded-lg px-1.5 sm:px-2 py-1" title="Sair">
+            <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-full bg-[#FF3B30]/20 flex items-center justify-center text-[10px] sm:text-xs font-bold text-[#FF3B30]">{coach.initials}</div>
           </button>
         </div>
       </header>
@@ -1493,7 +1858,7 @@ export default function Dashboard() {
                 <div 
                   className="grid gap-3" 
                   style={{ 
-                    gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))',
+                    gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))',
                     justifyItems: 'stretch',
                     alignItems: 'stretch',
                   }}
@@ -1569,7 +1934,7 @@ export default function Dashboard() {
                     <span className="text-sm">📊</span>
                     <span className="font-bold text-xs">Estatísticas do Dia</span>
                   </div>
-                  <DailyStatsChart queue={queue} />
+                  <DailyStatsChart queue={queue} cardioCount={cardioMembers.length} />
                 </div>
                 
                 <div className="flex-1 overflow-y-auto p-2">
@@ -1654,6 +2019,7 @@ export default function Dashboard() {
               setViewDetailsMember(null);
               setCheckoutModal(viewDetailsMember);
             }}
+            onRefresh={loadQueue}
           />
         )}
       </AnimatePresence>
@@ -2078,6 +2444,119 @@ export default function Dashboard() {
           if (!isMuted) playSound('success');
         }}
       />
+      
+      {/* ALERTA FULLSCREEN DE AMBIENTE */}
+      <AnimatePresence>
+        {showEnvAlert && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[9999] flex items-center justify-center"
+            style={{
+              background: `linear-gradient(135deg, ${NIVEL_CONFIG[envStatus.nivel].color}20 0%, ${NIVEL_CONFIG[envStatus.nivel].color}40 100%)`,
+              backdropFilter: 'blur(10px)',
+            }}
+            onClick={() => setShowEnvAlert(false)}
+          >
+            <motion.div
+              initial={{ scale: 0.8, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.8, opacity: 0 }}
+              className="text-center p-8 rounded-3xl"
+              style={{
+                background: 'rgba(0,0,0,0.9)',
+                border: `4px solid ${NIVEL_CONFIG[envStatus.nivel].color}`,
+                boxShadow: `0 0 60px ${NIVEL_CONFIG[envStatus.nivel].color}80`,
+                maxWidth: '90vw',
+                width: '500px',
+              }}
+            >
+              {/* Emoji Grande */}
+              <div className="text-8xl mb-4">{NIVEL_CONFIG[envStatus.nivel].emoji}</div>
+              
+              {/* Nível */}
+              <h1 
+                className="text-5xl font-black mb-2"
+                style={{ color: NIVEL_CONFIG[envStatus.nivel].color }}
+              >
+                {NIVEL_CONFIG[envStatus.nivel].label}
+              </h1>
+              
+              {/* Mensagem */}
+              <p className="text-xl text-white/80 mb-6">
+                {NIVEL_CONFIG[envStatus.nivel].mensagem}
+              </p>
+              
+              {/* Métricas */}
+              <div className="grid grid-cols-2 gap-4 mb-6">
+                <div 
+                  className="p-4 rounded-xl"
+                  style={{ background: `${NIVEL_CONFIG[envStatus.nivel].color}20` }}
+                >
+                  <p className="text-3xl font-black text-white">👥 {envStatus.alunosAtivos}</p>
+                  <p className="text-sm text-white/50">Alunos Ativos</p>
+                </div>
+                <div 
+                  className="p-4 rounded-xl"
+                  style={{ background: `${NIVEL_CONFIG[envStatus.nivel].color}20` }}
+                >
+                  <p className="text-3xl font-black text-white">👨‍🏫 {envStatus.professoresOnline}</p>
+                  <p className="text-sm text-white/50">Professores</p>
+                </div>
+              </div>
+              
+              {/* Ratio */}
+              <div 
+                className="p-3 rounded-xl mb-4"
+                style={{ 
+                  background: `${NIVEL_CONFIG[envStatus.nivel].color}30`,
+                  border: `2px solid ${NIVEL_CONFIG[envStatus.nivel].color}50`
+                }}
+              >
+                <p className="text-2xl font-bold" style={{ color: NIVEL_CONFIG[envStatus.nivel].color }}>
+                  RATIO: {envStatus.ratio.toFixed(1)}:1
+                </p>
+              </div>
+              
+              {/* Cards esperando */}
+              {envStatus.cardsEsperandoCritico > 0 && (
+                <div className="p-3 rounded-xl bg-red-500/20 border border-red-500/50 mb-4">
+                  <p className="text-lg font-bold text-red-400">
+                    🔴 {envStatus.cardsEsperandoCritico} cards aguardando {'>'} 5 minutos
+                  </p>
+                </div>
+              )}
+              
+              {/* Tempos Ajustados */}
+              <div className="flex justify-center gap-3 text-sm">
+                <span className="px-2 py-1 rounded bg-red-500/20 text-red-400">
+                  🔴 {Math.floor(envStatus.tempoVermelho / 60)}:{String(envStatus.tempoVermelho % 60).padStart(2, '0')}
+                </span>
+                <span className="px-2 py-1 rounded bg-orange-500/20 text-orange-400">
+                  🟠 {Math.floor(envStatus.tempoLaranja / 60)}:{String(envStatus.tempoLaranja % 60).padStart(2, '0')}
+                </span>
+                <span className="px-2 py-1 rounded bg-yellow-500/20 text-yellow-400">
+                  🟡 {Math.floor(envStatus.tempoAmarelo / 60)}:{String(envStatus.tempoAmarelo % 60).padStart(2, '0')}
+                </span>
+                <span className="px-2 py-1 rounded bg-green-500/20 text-green-400">
+                  🟢 {Math.floor(envStatus.tempoVerde / 60)}:{String(envStatus.tempoVerde % 60).padStart(2, '0')}
+                </span>
+              </div>
+              
+              {/* Ação */}
+              <p className="mt-4 text-sm text-white/50">
+                {NIVEL_CONFIG[envStatus.nivel].acao}
+              </p>
+              
+              {/* Toque para fechar */}
+              <p className="mt-6 text-xs text-white/30 animate-pulse">
+                Toque para fechar
+              </p>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
@@ -2578,8 +3057,15 @@ const MemberCard = forwardRef<HTMLDivElement, {
     return { icon: '📊', text: 'Aval. ✓', type: 'success' };
   };
   
+  const getMonitoramentoStatus = () => {
+    if (!member.hasMonitoramento) return { icon: '💓', text: 'Sem monit.', type: 'danger' };
+    if (member.monitoramentoVencido) return { icon: '💓', text: 'Vencido', type: 'warning' };
+    return { icon: '💓', text: 'Monit. ✓', type: 'success' };
+  };
+  
   const fichaStatus = getFichaStatus();
   const avaliacaoStatus = getAvaliacaoStatus();
+  const monitoramentoStatus = getMonitoramentoStatus();
   const hasAlert = member.helpRequested || isCritical;
   const isStripe = isCritical || member.priority === 'ORANGE';
 
@@ -2962,37 +3448,52 @@ const MemberCard = forwardRef<HTMLDivElement, {
           </div>
         </div>
         
-        {/* STATUS BAR */}
-        <div className="grid grid-cols-2 gap-2 mb-3">
+        {/* STATUS BAR - 3 indicadores */}
+        <div className="grid grid-cols-3 gap-1.5 mb-3">
           <div 
-            className="flex items-center justify-center gap-1.5"
+            className="flex items-center justify-center gap-1"
             style={{
-              padding: '5px 8px',
+              padding: '4px 6px',
               borderRadius: '6px',
-              fontSize: '10px',
+              fontSize: '9px',
               fontWeight: 600,
               background: fichaStatus.type === 'danger' ? 'rgba(255, 59, 48, 0.12)' : fichaStatus.type === 'warning' ? 'rgba(255, 149, 0, 0.12)' : 'rgba(48, 209, 88, 0.12)',
               border: `1px solid ${fichaStatus.type === 'danger' ? 'rgba(255, 59, 48, 0.3)' : fichaStatus.type === 'warning' ? 'rgba(255, 149, 0, 0.3)' : 'rgba(48, 209, 88, 0.3)'}`,
               color: fichaStatus.type === 'danger' ? '#FF6B6B' : fichaStatus.type === 'warning' ? '#FFB347' : '#4ADE80',
             }}
           >
-            <span style={{ fontSize: '11px' }}>{fichaStatus.icon}</span>
+            <span style={{ fontSize: '10px' }}>{fichaStatus.icon}</span>
             <span>{fichaStatus.text}</span>
           </div>
           <div 
-            className="flex items-center justify-center gap-1.5"
+            className="flex items-center justify-center gap-1"
             style={{
-              padding: '5px 8px',
+              padding: '4px 6px',
               borderRadius: '6px',
-              fontSize: '10px',
+              fontSize: '9px',
               fontWeight: 600,
               background: avaliacaoStatus.type === 'danger' ? 'rgba(255, 59, 48, 0.12)' : avaliacaoStatus.type === 'warning' ? 'rgba(255, 149, 0, 0.12)' : 'rgba(48, 209, 88, 0.12)',
               border: `1px solid ${avaliacaoStatus.type === 'danger' ? 'rgba(255, 59, 48, 0.3)' : avaliacaoStatus.type === 'warning' ? 'rgba(255, 149, 0, 0.3)' : 'rgba(48, 209, 88, 0.3)'}`,
               color: avaliacaoStatus.type === 'danger' ? '#FF6B6B' : avaliacaoStatus.type === 'warning' ? '#FFB347' : '#4ADE80',
             }}
           >
-            <span style={{ fontSize: '11px' }}>{avaliacaoStatus.icon}</span>
+            <span style={{ fontSize: '10px' }}>{avaliacaoStatus.icon}</span>
             <span>{avaliacaoStatus.text}</span>
+          </div>
+          <div 
+            className="flex items-center justify-center gap-1"
+            style={{
+              padding: '4px 6px',
+              borderRadius: '6px',
+              fontSize: '9px',
+              fontWeight: 600,
+              background: monitoramentoStatus.type === 'danger' ? 'rgba(255, 59, 48, 0.12)' : monitoramentoStatus.type === 'warning' ? 'rgba(255, 149, 0, 0.12)' : 'rgba(48, 209, 88, 0.12)',
+              border: `1px solid ${monitoramentoStatus.type === 'danger' ? 'rgba(255, 59, 48, 0.3)' : monitoramentoStatus.type === 'warning' ? 'rgba(255, 149, 0, 0.3)' : 'rgba(48, 209, 88, 0.3)'}`,
+              color: monitoramentoStatus.type === 'danger' ? '#FF6B6B' : monitoramentoStatus.type === 'warning' ? '#FFB347' : '#4ADE80',
+            }}
+          >
+            <span style={{ fontSize: '10px' }}>{monitoramentoStatus.icon}</span>
+            <span>{monitoramentoStatus.text}</span>
           </div>
         </div>
         
@@ -3143,93 +3644,82 @@ function CardioMemberCard({
   // Cor baseada no tempo restante
   const timerColor = timeRemaining < 60 ? '#FF3B30' : timeRemaining < 180 ? '#FF9500' : '#30D158';
   
+  // Nome formatado (primeiro e último nome)
+  const nameParts = member.memberName.split(' ');
+  const shortName = nameParts.length > 2 
+    ? `${nameParts[0]} ${nameParts[nameParts.length - 1]}`
+    : member.memberName;
+  
   return (
     <motion.div
       layout
       initial={{ opacity: 0, scale: 0.9 }}
       animate={{ opacity: 1, scale: 1 }}
       exit={{ opacity: 0, scale: 0.9 }}
-      className="relative flex overflow-hidden"
+      className="relative overflow-hidden"
       style={{ 
         background: 'linear-gradient(145deg, #0a1628 0%, #0d1117 100%)',
         borderRadius: '12px',
         border: '2px solid #06b6d4',
         boxShadow: '0 0 20px rgba(6, 182, 212, 0.3)',
-        minHeight: '160px',
       }}
     >
-      {/* BARRA LATERAL ANIMADA */}
-      <div className="relative flex flex-col" style={{ width: '6px', flexShrink: 0 }}>
+      {/* HEADER COM TIMER EM DESTAQUE */}
+      <div className="p-3 flex items-center gap-3">
+        {/* Avatar */}
         <div 
-          className="absolute left-0 top-0 w-full bg-cyan-500/30"
-          style={{ height: '100%' }}
-        />
-        <motion.div 
-          className="absolute left-0 bottom-0 w-full bg-cyan-400"
-          initial={{ height: '0%' }}
-          animate={{ height: `${progress}%` }}
-          transition={{ duration: 0.5 }}
-        />
-      </div>
-      
-      {/* CONTEÚDO */}
-      <div className="flex-1 p-4">
-        {/* HEADER */}
-        <div className="flex items-center justify-between mb-3">
-          <div className="flex items-center gap-3">
-            {/* Avatar */}
-            <div 
-              className="relative flex items-center justify-center font-bold text-white overflow-hidden"
-              style={{
-                width: '44px',
-                height: '44px',
-                borderRadius: '10px',
-                background: `linear-gradient(135deg, ${p.color} 0%, ${p.color}cc 100%)`,
-                fontSize: '13px',
-              }}
-            >
-              {member.photoUrl ? (
-                <img 
-                  src={member.photoUrl} 
-                  alt={member.memberName}
-                  className="w-full h-full object-cover"
-                />
-              ) : (
-                member.memberName.split(' ').map(n => n[0]).slice(0, 2).join('')
-              )}
-              {/* Badge de cardio */}
-              <div className="absolute -bottom-1 -right-1 w-5 h-5 bg-cyan-500 rounded-full flex items-center justify-center text-[10px] border-2 border-black">
-                🏃
-              </div>
-            </div>
-            
-            <div className="flex-1 min-w-0">
-              <span 
-                className="font-bold text-white block truncate"
-                style={{ fontSize: '13px' }}
-              >
-                {member.memberName.toUpperCase()}
-              </span>
-              <span className="text-xs text-cyan-400/70">
-                {member.cardioDurationMinutes} min de cardio
-              </span>
-            </div>
-          </div>
-          
-          {/* TIMER GRANDE */}
-          <div className="text-right">
-            <div 
-              className="font-mono font-bold text-2xl"
-              style={{ color: timerColor }}
-            >
-              {timerFormatted}
-            </div>
-            <div className="text-[10px] text-white/40 uppercase">Restante</div>
+          className="relative flex-shrink-0 flex items-center justify-center font-bold text-white overflow-hidden"
+          style={{
+            width: '48px',
+            height: '48px',
+            borderRadius: '10px',
+            background: `linear-gradient(135deg, ${p.color} 0%, ${p.color}cc 100%)`,
+            fontSize: '14px',
+          }}
+        >
+          {member.photoUrl ? (
+            <img 
+              src={member.photoUrl} 
+              alt={member.memberName}
+              className="w-full h-full object-cover"
+            />
+          ) : (
+            member.memberName.split(' ').map(n => n[0]).slice(0, 2).join('')
+          )}
+          {/* Badge de cardio */}
+          <div className="absolute -bottom-1 -right-1 w-5 h-5 bg-cyan-500 rounded-full flex items-center justify-center text-[10px] border-2 border-[#0a1628]">
+            🏃
           </div>
         </div>
         
-        {/* BARRA DE PROGRESSO */}
-        <div className="h-2 bg-white/10 rounded-full overflow-hidden mb-3">
+        {/* Nome e info */}
+        <div className="flex-1 min-w-0">
+          <span 
+            className="font-bold text-white block truncate text-sm"
+            title={member.memberName}
+          >
+            {shortName.toUpperCase()}
+          </span>
+          <span className="text-xs text-cyan-400/70">
+            {member.cardioDurationMinutes} min de cardio
+          </span>
+        </div>
+        
+        {/* TIMER - sempre visível */}
+        <div className="flex-shrink-0 text-right">
+          <div 
+            className="font-mono font-black text-xl tabular-nums"
+            style={{ color: timerColor, minWidth: '65px' }}
+          >
+            {timerFormatted}
+          </div>
+          <div className="text-[9px] text-white/40 uppercase">restante</div>
+        </div>
+      </div>
+      
+      {/* BARRA DE PROGRESSO */}
+      <div className="px-3">
+        <div className="h-1.5 bg-white/10 rounded-full overflow-hidden">
           <motion.div 
             className="h-full bg-gradient-to-r from-cyan-500 to-cyan-400"
             initial={{ width: '0%' }}
@@ -3237,32 +3727,32 @@ function CardioMemberCard({
             transition={{ duration: 0.5 }}
           />
         </div>
-        
-        {/* INFO E BOTÕES */}
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <span 
-              className={`text-xs px-2 py-1 rounded-lg ${
-                member.cardioDestination === 'QUEUE' 
-                  ? 'bg-blue-500/20 text-blue-400' 
-                  : 'bg-green-500/20 text-green-400'
-              }`}
-            >
-              {member.cardioDestination === 'QUEUE' ? '🔄 Volta pra fila' : '✅ Finaliza'}
-            </span>
-            <span className="text-xs text-white/30">
-              • {member.cardioStartedByCoachName}
-            </span>
-          </div>
-          
-          <button
-            onClick={onFinishEarly}
-            className="px-3 py-1.5 bg-white/10 hover:bg-red-500/20 text-white/60 hover:text-red-400 rounded-lg text-xs font-medium transition-all"
-            title="Finalizar cardio agora"
+      </div>
+      
+      {/* FOOTER */}
+      <div className="p-3 pt-2 flex items-center justify-between">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span 
+            className={`text-[10px] px-2 py-0.5 rounded ${
+              member.cardioDestination === 'QUEUE' 
+                ? 'bg-blue-500/20 text-blue-400' 
+                : 'bg-green-500/20 text-green-400'
+            }`}
           >
-            ⏹️ Encerrar
-          </button>
+            {member.cardioDestination === 'QUEUE' ? '🔄 Volta pra fila' : '✅ Finaliza'}
+          </span>
+          <span className="text-[10px] text-white/30">
+            • {member.cardioStartedByCoachName}
+          </span>
         </div>
+        
+        <button
+          onClick={onFinishEarly}
+          className="px-2 py-1 bg-white/10 hover:bg-red-500/20 text-white/60 hover:text-red-400 rounded text-[10px] font-medium transition-all flex-shrink-0"
+          title="Finalizar cardio agora"
+        >
+          ⏹️ Encerrar
+        </button>
       </div>
     </motion.div>
   );
@@ -3385,7 +3875,7 @@ function FinishedMemberCard({
 // DAILY STATS CHART - Gráfico de estatísticas por cor
 // ============================================================================
 
-function DailyStatsChart({ queue }: { queue: QueueMember[] }) {
+function DailyStatsChart({ queue, cardioCount = 0 }: { queue: QueueMember[]; cardioCount?: number }) {
   // Calcular estatísticas por cor
   const statsByColor = useMemo(() => {
     const stats: Record<string, { count: number; totalRetention: number; color: string; label: string }> = {
@@ -3407,7 +3897,8 @@ function DailyStatsChart({ queue }: { queue: QueueMember[] }) {
     return stats;
   }, [queue]);
   
-  const totalMembers = queue.length;
+  // Total inclui membros em cardio
+  const totalMembers = queue.length + cardioCount;
   const maxCount = Math.max(...Object.values(statsByColor).map(s => s.count), 1);
   
   return (
@@ -3447,6 +3938,14 @@ function DailyStatsChart({ queue }: { queue: QueueMember[] }) {
         <span className="text-[10px] text-white/50">Total na academia:</span>
         <span className="text-sm font-bold">{totalMembers}</span>
       </div>
+      
+      {/* Em cardio */}
+      {cardioCount > 0 && (
+        <div className="flex items-center justify-between">
+          <span className="text-[10px] text-cyan-400/70">🏃 Fazendo cardio:</span>
+          <span className="text-sm font-bold text-cyan-400">{cardioCount}</span>
+        </div>
+      )}
       
       {/* Média geral */}
       {totalMembers > 0 && (
@@ -3627,6 +4126,7 @@ function MemberDetailsModal({
   onAttend,
   onNotify,
   onCheckout,
+  onRefresh,
 }: { 
   member: QueueMember; 
   coach: { id: string; name: string };
@@ -3634,6 +4134,7 @@ function MemberDetailsModal({
   onAttend: () => void;
   onNotify: () => void;
   onCheckout: () => void;
+  onRefresh?: () => void;
 }) {
   const p = PRIORITY_CONFIG[member.priority] || PRIORITY_CONFIG.YELLOW;
   const timeInGym = calcTimeInGym(member.checkInTime);
@@ -3648,6 +4149,10 @@ function MemberDetailsModal({
   const [workoutsLoaded, setWorkoutsLoaded] = useState(false);
   const [expandedWorkout, setExpandedWorkout] = useState<number | null>(null);
   const [expandedSeries, setExpandedSeries] = useState<number | null>(null);
+  
+  // Estado para modal de foto
+  const [showPhotoModal, setShowPhotoModal] = useState(false);
+  const [currentPhotoUrl, setCurrentPhotoUrl] = useState<string | undefined>(member.photoUrl || undefined);
 
   const getTankColor = () => {
     if (retentionScore >= 75) return '#30D158';
@@ -3657,10 +4162,11 @@ function MemberDetailsModal({
   };
 
   // Carregar treinos quando abrir modal de treinos
-  const handleOpenWorkouts = async () => {
+  const handleOpenWorkouts = async (forceReload = false) => {
     setShowWorkoutsModal(true);
     
-    if (workoutsLoaded) return; // Já carregou
+    // Se já carregou e não é força de atualização, retornar
+    if (workoutsLoaded && !forceReload) return;
     
     if (!member.evoMemberId) {
       setWorkoutError('SEM_EVO_ID');
@@ -3669,25 +4175,44 @@ function MemberDetailsModal({
     
     setLoadingWorkouts(true);
     setWorkoutError(null);
+    setWorkouts([]); // Limpar workouts anteriores
     
     try {
       console.log('[Workouts] Buscando treinos para cliente:', member.evoMemberId);
-      const res = await fetch(`/api/evo/workouts?idClient=${member.evoMemberId}`);
+      // IMPORTANTE: A API usa inactive=true para buscar treinos ativos E vencidos
+      const res = await fetch(`/api/evo/workouts?idClient=${member.evoMemberId}&debug=true`);
       const data = await res.json();
       
-      console.log('[Workouts] Resposta:', data);
+      console.log('[Workouts] Resposta completa:', data);
+      console.log('[Workouts] Total de treinos:', data.totalWorkouts);
+      console.log('[Workouts] Ativos:', data.activeWorkouts, 'Vencidos:', data.expiredWorkouts);
       
       if (data.success) {
-        setWorkouts(data.workouts || []);
+        const treinos = data.workouts || [];
+        setWorkouts(treinos);
         setWorkoutsLoaded(true);
-        if (!data.workouts || data.workouts.length === 0) {
+        
+        if (treinos.length === 0) {
+          console.log('[Workouts] Nenhum treino encontrado - definindo erro SEM_FICHA');
           setWorkoutError('SEM_FICHA');
+        } else {
+          console.log('[Workouts] Treinos carregados com sucesso:', treinos.length);
+          // Logar estrutura do primeiro treino para debug
+          if (treinos[0]) {
+            console.log('[Workouts] Estrutura do primeiro treino:', {
+              id: treinos[0].idTreino,
+              nome: treinos[0].nomeTreino,
+              series: treinos[0].series?.length || 0,
+              seriesV2: treinos[0].seriesCompletoV2?.length || 0,
+            });
+          }
         }
       } else {
+        console.error('[Workouts] Erro na API:', data.error);
         setWorkoutError(data.error || 'Erro ao carregar treinos');
       }
     } catch (err) {
-      console.error('Erro ao carregar treinos:', err);
+      console.error('[Workouts] Erro de conexão:', err);
       setWorkoutError('Erro de conexão com o servidor');
     } finally {
       setLoadingWorkouts(false);
@@ -3756,32 +4281,49 @@ function MemberDetailsModal({
             
             {/* Foto Grande em Destaque */}
             <div className="flex flex-col items-center pt-6 pb-4">
-              <div 
-                className="rounded-2xl flex items-center justify-center text-5xl font-bold text-white overflow-hidden mb-4"
-                style={{ 
-                  width: '180px',
-                  height: '180px',
-                  background: `linear-gradient(135deg, ${p.color} 0%, ${p.color}cc 100%)`,
-                  border: isLowRetention ? '4px solid #FF3B30' : `3px solid ${p.color}`,
-                  boxShadow: isLowRetention 
-                    ? '0 10px 40px rgba(255,59,48,0.5)'
-                    : `0 10px 40px ${p.color}40`,
-                }}
-              >
-                {member.photoUrl ? (
-                  <img 
-                    src={member.photoUrl} 
-                    alt={member.name}
-                    className="w-full h-full object-cover"
-                    style={{ imageRendering: 'auto', filter: 'contrast(1.02)' }}
-                    onError={(e) => {
-                      e.currentTarget.style.display = 'none';
-                      e.currentTarget.parentElement!.innerHTML = member.name.split(' ').map(n => n[0]).slice(0, 2).join('');
-                    }}
-                  />
-                ) : (
-                  member.name.split(' ').map(n => n[0]).slice(0, 2).join('')
-                )}
+              <div className="flex items-center gap-4">
+                {/* Foto */}
+                <div 
+                  className="rounded-2xl flex items-center justify-center text-5xl font-bold text-white overflow-hidden"
+                  style={{ 
+                    width: '180px',
+                    height: '180px',
+                    background: `linear-gradient(135deg, ${p.color} 0%, ${p.color}cc 100%)`,
+                    border: isLowRetention ? '4px solid #FF3B30' : `3px solid ${p.color}`,
+                    boxShadow: isLowRetention 
+                      ? '0 10px 40px rgba(255,59,48,0.5)'
+                      : `0 10px 40px ${p.color}40`,
+                  }}
+                >
+                  {currentPhotoUrl ? (
+                    <img 
+                      src={currentPhotoUrl} 
+                      alt={member.name}
+                      className="w-full h-full object-cover"
+                      style={{ imageRendering: 'auto', filter: 'contrast(1.02)' }}
+                      onError={(e) => {
+                        e.currentTarget.style.display = 'none';
+                        e.currentTarget.parentElement!.innerHTML = member.name.split(' ').map(n => n[0]).slice(0, 2).join('');
+                      }}
+                    />
+                  ) : (
+                    member.name.split(' ').map(n => n[0]).slice(0, 2).join('')
+                  )}
+                </div>
+                
+                {/* Botão de Câmera ao lado */}
+                <button
+                  onClick={() => setShowPhotoModal(true)}
+                  className="flex flex-col items-center gap-2 p-3 bg-white/5 hover:bg-cyan-500/20 border border-white/10 hover:border-cyan-500/50 rounded-xl transition-all group"
+                  title="Tirar foto do aluno"
+                >
+                  <div className="w-12 h-12 bg-cyan-500/20 group-hover:bg-cyan-500/30 rounded-xl flex items-center justify-center transition-all">
+                    <span className="text-2xl">📷</span>
+                  </div>
+                  <span className="text-xs text-white/50 group-hover:text-cyan-400 transition-colors">
+                    {currentPhotoUrl ? 'Trocar' : 'Tirar'}<br/>Foto
+                  </span>
+                </button>
               </div>
               
               <h2 className="text-xl font-bold text-center px-4">{member.name}</h2>
@@ -3912,7 +4454,7 @@ function MemberDetailsModal({
           <div className="p-4 border-t border-white/5 space-y-3">
             {/* Botão Ver Ficha de Treino */}
             <button
-              onClick={handleOpenWorkouts}
+              onClick={() => handleOpenWorkouts()}
               className="w-full py-3 rounded-xl font-bold text-cyan-400 bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center gap-2 hover:bg-cyan-500/20 transition-all"
             >
               🏋️ Ver Ficha de Treino Completa
@@ -4032,13 +4574,21 @@ function MemberDetailsModal({
               {/* ERRO: Outro erro */}
               {!loadingWorkouts && workoutError && workoutError !== 'SEM_FICHA' && workoutError !== 'SEM_EVO_ID' && (
                 <div className="text-center py-12">
-                  <div className="w-20 h-20 rounded-full bg-red-500/20 flex items-center justify-center mx-auto mb-4">
-                    <span className="text-4xl">❌</span>
+                  <div className="w-20 h-20 rounded-full bg-orange-500/20 flex items-center justify-center mx-auto mb-4">
+                    <span className="text-4xl">{workoutError.includes('429') || workoutError.includes('Rate') ? '⏱️' : '❌'}</span>
                   </div>
-                  <p className="text-red-400 font-bold text-lg mb-2">Erro ao carregar</p>
-                  <p className="text-white/50 text-sm mb-6">{workoutError}</p>
+                  <p className="text-orange-400 font-bold text-lg mb-2">
+                    {workoutError.includes('429') || workoutError.includes('Rate') 
+                      ? 'API sobrecarregada' 
+                      : 'Erro ao carregar'}
+                  </p>
+                  <p className="text-white/50 text-sm mb-6">
+                    {workoutError.includes('429') || workoutError.includes('Rate')
+                      ? 'A API do EVO está temporariamente limitada. Aguarde alguns segundos e tente novamente.'
+                      : workoutError}
+                  </p>
                   <button
-                    onClick={() => { setWorkoutsLoaded(false); setWorkoutError(null); handleOpenWorkouts(); }}
+                    onClick={() => handleOpenWorkouts(true)}
                     className="px-6 py-3 bg-white/10 text-white rounded-xl font-bold hover:bg-white/20 transition-all"
                   >
                     🔄 Tentar novamente
@@ -4048,21 +4598,93 @@ function MemberDetailsModal({
 
               {/* ALERTA: Só tem fichas vencidas */}
               {!loadingWorkouts && !workoutError && hasOnlyExpired && (
-                <div className="mb-6 p-5 bg-red-500/10 border-2 border-red-500/30 rounded-xl">
-                  <div className="flex items-start gap-4">
-                    <span className="text-3xl">⚠️</span>
-                    <div className="flex-1">
-                      <p className="text-red-400 font-bold text-lg">FICHA VENCIDA!</p>
-                      <p className="text-white/60 text-sm mt-1">
-                        Todas as fichas deste aluno estão vencidas. É necessário renovar o treino.
-                      </p>
-                      <button
-                        onClick={() => { setShowWorkoutsModal(false); onNotify(); }}
-                        className="mt-4 px-5 py-2.5 bg-orange-500/20 text-orange-400 rounded-xl font-bold text-sm hover:bg-orange-500/30 transition-all flex items-center gap-2 border border-orange-500/30"
-                      >
-                        🔄 Solicitar Renovação de Treino
-                      </button>
+                <div className="space-y-4">
+                  <div className="p-5 bg-red-500/10 border-2 border-red-500/30 rounded-xl">
+                    <div className="flex items-start gap-4">
+                      <span className="text-3xl">⚠️</span>
+                      <div className="flex-1">
+                        <p className="text-red-400 font-bold text-lg">FICHA VENCIDA!</p>
+                        <p className="text-white/60 text-sm mt-1">
+                          Todas as fichas deste aluno estão vencidas. É necessário renovar o treino.
+                        </p>
+                        <button
+                          onClick={() => { setShowWorkoutsModal(false); onNotify(); }}
+                          className="mt-4 px-5 py-2.5 bg-orange-500/20 text-orange-400 rounded-xl font-bold text-sm hover:bg-orange-500/30 transition-all flex items-center gap-2 border border-orange-500/30"
+                        >
+                          🔄 Solicitar Renovação de Treino
+                        </button>
+                      </div>
                     </div>
+                  </div>
+
+                  {/* MOSTRAR TREINOS VENCIDOS PARA CONSULTA */}
+                  <div className="pt-4">
+                    <p className="text-sm text-white/60 mb-3">
+                      📋 <span className="font-bold text-white">{expiredWorkouts.length}</span> {expiredWorkouts.length === 1 ? 'Ficha Vencida' : 'Fichas Vencidas'} (para consulta)
+                    </p>
+                    
+                    {/* Cards horizontais dos treinos vencidos */}
+                    <div 
+                      className="flex gap-3 overflow-x-auto pb-2 snap-x snap-mandatory"
+                      style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}
+                    >
+                      {expiredWorkouts.map((workout, wIdx) => {
+                        const status = getWorkoutStatus(workout);
+                        const isSelected = expandedWorkout === workout.idTreino;
+                        const letters = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
+                        const letter = letters[wIdx] || String(wIdx + 1);
+                        
+                        return (
+                          <button
+                            key={workout.idTreino}
+                            onClick={() => setExpandedWorkout(isSelected ? null : workout.idTreino)}
+                            className={`flex-shrink-0 snap-center rounded-xl p-4 transition-all duration-300 ${
+                              isSelected 
+                                ? 'bg-red-500/20 border-2 border-red-500 scale-105' 
+                                : 'bg-white/5 border border-white/10 hover:bg-white/10'
+                            }`}
+                            style={{ minWidth: '130px' }}
+                          >
+                            <div 
+                              className="w-14 h-14 rounded-xl flex items-center justify-center font-black text-2xl mx-auto mb-2"
+                              style={{ 
+                                background: isSelected ? status.color : `${status.color}30`,
+                                color: isSelected ? '#fff' : status.color,
+                              }}
+                            >
+                              {letter}
+                            </div>
+                            <p className="font-bold text-xs text-center truncate mb-1">
+                              {workout.nomeTreino || `Treino ${letter}`}
+                            </p>
+                            <div 
+                              className="text-[9px] px-2 py-0.5 rounded-full text-center font-medium mx-auto"
+                              style={{ background: `${status.color}20`, color: status.color, width: 'fit-content' }}
+                            >
+                              {status.label}
+                            </div>
+                            {isSelected && <div className="text-red-400 text-center mt-2">▼</div>}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    {/* Detalhes do treino vencido selecionado */}
+                    {expandedWorkout && expiredWorkouts.find(w => w.idTreino === expandedWorkout) && (
+                      <WorkoutDetailsPanel 
+                        workout={expiredWorkouts.find(w => w.idTreino === expandedWorkout)!}
+                        formatDate={formatDate}
+                        getWorkoutStatus={getWorkoutStatus}
+                        expandedSeries={expandedSeries}
+                        setExpandedSeries={setExpandedSeries}
+                      />
+                    )}
+
+                    {!expandedWorkout && (
+                      <p className="text-center text-white/40 text-sm py-4">
+                        👆 Toque em uma ficha vencida para ver os exercícios
+                      </p>
+                    )}
                   </div>
                 </div>
               )}
@@ -4144,29 +4766,51 @@ function MemberDetailsModal({
                 </div>
               )}
 
-              {/* TREINOS VENCIDOS (mostrar abaixo) */}
+              {/* TREINOS VENCIDOS (mostrar abaixo quando há treinos ativos também) */}
               {!loadingWorkouts && !workoutError && expiredWorkouts.length > 0 && validWorkouts.length > 0 && (
                 <div className="mt-6 pt-6 border-t border-white/10">
-                  <p className="text-sm text-white/40 mb-3">📁 Treinos Vencidos ({expiredWorkouts.length})</p>
-                  <div className="space-y-2 opacity-60">
-                    {expiredWorkouts.slice(0, 3).map((workout, wIdx) => {
+                  <p className="text-sm text-white/40 mb-3">
+                    📁 Treinos Vencidos ({expiredWorkouts.length}) - <span className="text-white/30">clique para expandir</span>
+                  </p>
+                  <div className="space-y-2">
+                    {expiredWorkouts.map((workout, wIdx) => {
                       const letters = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
                       const letter = letters[wIdx] || String(wIdx + 1);
+                      const isExpanded = expandedWorkout === workout.idTreino;
                       
                       return (
-                        <div 
-                          key={workout.idTreino}
-                          className="p-3 bg-white/5 rounded-lg border border-white/10 flex items-center justify-between"
-                        >
-                          <div className="flex items-center gap-3">
-                            <span className="w-8 h-8 rounded-lg bg-red-500/20 text-red-400 flex items-center justify-center font-bold text-sm">
-                              {letter}
-                            </span>
-                            <div>
-                              <p className="font-medium text-sm">{workout.nomeTreino || `Treino ${letter}`}</p>
-                              <p className="text-xs text-red-400">Venceu em {formatDate(workout.dataValidade)}</p>
+                        <div key={workout.idTreino}>
+                          <button 
+                            onClick={() => setExpandedWorkout(isExpanded ? null : workout.idTreino)}
+                            className={`w-full p-3 rounded-lg border flex items-center justify-between transition-all ${
+                              isExpanded 
+                                ? 'bg-red-500/20 border-red-500/50' 
+                                : 'bg-white/5 border-white/10 hover:bg-white/10 opacity-60'
+                            }`}
+                          >
+                            <div className="flex items-center gap-3">
+                              <span className="w-8 h-8 rounded-lg bg-red-500/20 text-red-400 flex items-center justify-center font-bold text-sm">
+                                {letter}
+                              </span>
+                              <div className="text-left">
+                                <p className="font-medium text-sm">{workout.nomeTreino || `Treino ${letter}`}</p>
+                                <p className="text-xs text-red-400">Venceu em {formatDate(workout.dataValidade)}</p>
+                              </div>
                             </div>
-                          </div>
+                            <span className={`text-white/40 transition-transform ${isExpanded ? 'rotate-180' : ''}`}>▼</span>
+                          </button>
+                          
+                          {isExpanded && (
+                            <div className="mt-2">
+                              <WorkoutDetailsPanel 
+                                workout={workout}
+                                formatDate={formatDate}
+                                getWorkoutStatus={getWorkoutStatus}
+                                expandedSeries={expandedSeries}
+                                setExpandedSeries={setExpandedSeries}
+                              />
+                            </div>
+                          )}
                         </div>
                       );
                     })}
@@ -4187,7 +4831,502 @@ function MemberDetailsModal({
           </motion.div>
         </motion.div>
       )}
+
+      {/* MODAL DE CAPTURA DE FOTO */}
+      <AnimatePresence>
+        {showPhotoModal && (
+          <PhotoCaptureModal
+            evoMemberId={member.evoMemberId || 0}
+            memberName={member.name}
+            currentPhotoUrl={currentPhotoUrl}
+            onPhotoUpdated={(newUrl) => {
+              setCurrentPhotoUrl(newUrl);
+              // Recarregar a fila para atualizar o card
+              if (onRefresh) onRefresh();
+            }}
+            onClose={() => setShowPhotoModal(false)}
+          />
+        )}
+      </AnimatePresence>
     </>
+  );
+}
+
+// Componente de Captura de Foto
+function PhotoCaptureModal({
+  evoMemberId,
+  memberName,
+  currentPhotoUrl,
+  onPhotoUpdated,
+  onClose,
+}: {
+  evoMemberId: number;
+  memberName: string;
+  currentPhotoUrl?: string;
+  onPhotoUpdated: (newUrl: string) => void;
+  onClose: () => void;
+}) {
+  const [mode, setMode] = useState<'choose' | 'camera' | 'preview'>('choose');
+  const [stream, setStream] = useState<MediaStream | null>(null);
+  const [capturedImage, setCapturedImage] = useState<string | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState(false);
+  const [useFrontCamera, setUseFrontCamera] = useState(true);
+
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Parar câmera ao desmontar
+  useEffect(() => {
+    return () => {
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+      }
+    };
+  }, [stream]);
+
+  // Lista de câmeras disponíveis
+  const [availableCameras, setAvailableCameras] = useState<MediaDeviceInfo[]>([]);
+  const [selectedCameraId, setSelectedCameraId] = useState<string | null>(null);
+
+  // Detectar câmeras disponíveis ao montar
+  useEffect(() => {
+    const detectCameras = async () => {
+      try {
+        // Primeiro precisamos pedir permissão para listar dispositivos
+        await navigator.mediaDevices.getUserMedia({ video: true }).then(s => {
+          s.getTracks().forEach(t => t.stop());
+        });
+        
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const cameras = devices.filter(d => d.kind === 'videoinput');
+        console.log('📷 Câmeras detectadas:', cameras.map(c => ({ id: c.deviceId, label: c.label })));
+        setAvailableCameras(cameras);
+      } catch (err) {
+        console.error('Erro ao detectar câmeras:', err);
+      }
+    };
+    detectCameras();
+  }, []);
+
+  // Iniciar câmera com melhor compatibilidade
+  const startCamera = async (frontCamera = true, deviceId?: string) => {
+    setError(null);
+    
+    // Parar stream anterior se existir
+    if (stream) {
+      stream.getTracks().forEach(track => track.stop());
+    }
+    
+    try {
+      let mediaStream: MediaStream;
+      
+      // Se temos um deviceId específico, usar ele
+      if (deviceId) {
+        console.log('📷 Tentando câmera específica:', deviceId);
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          video: { 
+            deviceId: { exact: deviceId },
+            width: { ideal: 1280, min: 640 },
+            height: { ideal: 960, min: 480 },
+          },
+          audio: false,
+        });
+        setSelectedCameraId(deviceId);
+        // Detectar se é frontal pelo label
+        const camera = availableCameras.find(c => c.deviceId === deviceId);
+        const isFront = !!(camera?.label?.toLowerCase().includes('front') || 
+                       camera?.label?.toLowerCase().includes('user') ||
+                       camera?.label?.toLowerCase().includes('frontal'));
+        setUseFrontCamera(isFront);
+      } else {
+        // Tentar por facingMode
+        console.log('📷 Tentando câmera por facingMode:', frontCamera ? 'user' : 'environment');
+        
+        try {
+          mediaStream = await navigator.mediaDevices.getUserMedia({
+            video: { 
+              facingMode: { exact: frontCamera ? 'user' : 'environment' },
+              width: { ideal: 1280, min: 640 },
+              height: { ideal: 960, min: 480 },
+            },
+            audio: false,
+          });
+          setUseFrontCamera(frontCamera);
+        } catch (facingErr) {
+          console.log('📷 facingMode exact falhou, tentando ideal...');
+          
+          // Fallback: usar ideal ao invés de exact
+          mediaStream = await navigator.mediaDevices.getUserMedia({
+            video: { 
+              facingMode: { ideal: frontCamera ? 'user' : 'environment' },
+              width: { ideal: 1280, min: 640 },
+              height: { ideal: 960, min: 480 },
+            },
+            audio: false,
+          });
+          setUseFrontCamera(frontCamera);
+        }
+      }
+      
+      setStream(mediaStream);
+      setMode('camera');
+      
+      // Salvar o deviceId da câmera que está sendo usada
+      const videoTrack = mediaStream.getVideoTracks()[0];
+      if (videoTrack) {
+        const settings = videoTrack.getSettings();
+        if (settings.deviceId) {
+          setSelectedCameraId(settings.deviceId);
+        }
+        console.log('📷 Câmera ativa:', videoTrack.label, settings);
+      }
+      
+      setTimeout(() => {
+        if (videoRef.current) {
+          videoRef.current.srcObject = mediaStream;
+        }
+      }, 100);
+      
+    } catch (err) {
+      console.error('📷 Erro ao acessar câmera:', err);
+      
+      // Último fallback: qualquer câmera
+      try {
+        console.log('📷 Fallback: tentando qualquer câmera disponível...');
+        const fallbackStream = await navigator.mediaDevices.getUserMedia({
+          video: { width: { ideal: 1280 }, height: { ideal: 960 } },
+          audio: false,
+        });
+        
+        setStream(fallbackStream);
+        setUseFrontCamera(true);
+        setMode('camera');
+        
+        const videoTrack = fallbackStream.getVideoTracks()[0];
+        if (videoTrack) {
+          console.log('📷 Câmera fallback:', videoTrack.label);
+        }
+        
+        setTimeout(() => {
+          if (videoRef.current) {
+            videoRef.current.srcObject = fallbackStream;
+          }
+        }, 100);
+        
+      } catch (fallbackErr) {
+        console.error('📷 Erro ao acessar qualquer câmera:', fallbackErr);
+        setError('Não foi possível acessar a câmera. Verifique as permissões do navegador.');
+      }
+    }
+  };
+  
+  // Alternar entre câmeras disponíveis
+  const switchCamera = () => {
+    if (availableCameras.length <= 1) {
+      // Se só tem uma câmera, tentar trocar por facingMode
+      startCamera(!useFrontCamera);
+      return;
+    }
+    
+    // Se tem múltiplas câmeras, ir para a próxima
+    const currentIndex = availableCameras.findIndex(c => c.deviceId === selectedCameraId);
+    const nextIndex = (currentIndex + 1) % availableCameras.length;
+    const nextCamera = availableCameras[nextIndex];
+    
+    console.log('📷 Trocando para câmera:', nextCamera.label || nextCamera.deviceId);
+    startCamera(useFrontCamera, nextCamera.deviceId);
+  };
+
+  // Parar câmera
+  const stopCamera = () => {
+    if (stream) {
+      stream.getTracks().forEach(track => track.stop());
+      setStream(null);
+    }
+  };
+
+  // Capturar foto com alta qualidade
+  const capturePhoto = () => {
+    if (!videoRef.current || !canvasRef.current) return;
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    
+    // Usar resolução real do vídeo para melhor qualidade
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    
+    // Espelhar apenas se for câmera frontal
+    if (useFrontCamera) {
+      ctx.translate(canvas.width, 0);
+      ctx.scale(-1, 1);
+    }
+    
+    ctx.drawImage(video, 0, 0);
+    
+    // Qualidade 0.85 (85%) - bom equilíbrio entre qualidade e tamanho
+    // Resulta em ~100-300KB por foto (similar ao EVO)
+    const imageData = canvas.toDataURL('image/jpeg', 0.85);
+    setCapturedImage(imageData);
+    setMode('preview');
+    stopCamera();
+  };
+
+  // Selecionar arquivo
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      setError('Por favor, selecione uma imagem.');
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      setError('A imagem deve ter no máximo 5MB.');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      setCapturedImage(reader.result as string);
+      setMode('preview');
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // Upload
+  const uploadPhoto = async () => {
+    if (!capturedImage || !evoMemberId) return;
+    setUploading(true);
+    setError(null);
+    try {
+      const response = await fetch(capturedImage);
+      const blob = await response.blob();
+      const formData = new FormData();
+      formData.append('photo', blob, `${evoMemberId}.jpg`);
+      formData.append('evoMemberId', String(evoMemberId));
+      formData.append('memberName', memberName);
+
+      const uploadResponse = await fetch('/api/members/photo', {
+        method: 'POST',
+        body: formData,
+      });
+      const result = await uploadResponse.json();
+
+      if (result.success) {
+        setSuccess(true);
+        onPhotoUpdated(result.photoUrl);
+        setTimeout(() => onClose(), 1500);
+      } else {
+        setError(result.error || 'Erro ao salvar foto');
+      }
+    } catch (err) {
+      console.error('Erro no upload:', err);
+      setError('Erro ao enviar foto. Tente novamente.');
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  // Reset
+  const reset = () => {
+    setCapturedImage(null);
+    setError(null);
+    stopCamera();
+    setMode('choose');
+  };
+
+  const handleClose = () => {
+    stopCamera();
+    onClose();
+  };
+
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      className="fixed inset-0 z-[200] flex items-center justify-center p-4 bg-black/90"
+      onClick={handleClose}
+    >
+      <motion.div
+        initial={{ scale: 0.9, opacity: 0 }}
+        animate={{ scale: 1, opacity: 1 }}
+        exit={{ scale: 0.9, opacity: 0 }}
+        className="w-full max-w-md bg-zinc-900 rounded-2xl overflow-hidden border border-white/10"
+        onClick={e => e.stopPropagation()}
+      >
+        {/* Header */}
+        <div className="p-4 border-b border-white/10 flex items-center justify-between">
+          <div>
+            <h3 className="font-bold text-lg">📸 Foto do Aluno</h3>
+            <p className="text-white/50 text-sm">{memberName}</p>
+          </div>
+          <button onClick={handleClose} className="p-2 hover:bg-white/10 rounded-full">✕</button>
+        </div>
+
+        {/* Conteúdo */}
+        <div className="p-4">
+          {success && (
+            <div className="text-center py-8">
+              <div className="w-20 h-20 bg-green-500/20 rounded-full flex items-center justify-center mx-auto mb-4">
+                <span className="text-5xl">✅</span>
+              </div>
+              <h4 className="text-xl font-bold text-green-400">Foto Salva!</h4>
+              <p className="text-white/50 mt-2">A foto foi atualizada com sucesso.</p>
+            </div>
+          )}
+
+          {error && !success && (
+            <div className="mb-4 p-3 bg-red-500/20 border border-red-500/30 rounded-lg text-red-400 text-sm">
+              ⚠️ {error}
+            </div>
+          )}
+
+          {mode === 'choose' && !success && (
+            <div className="space-y-3">
+              {currentPhotoUrl && (
+                <div className="text-center mb-4">
+                  <p className="text-white/50 text-sm mb-2">Foto atual:</p>
+                  <img src={currentPhotoUrl} alt={memberName} className="w-32 h-32 rounded-xl object-cover mx-auto border-2 border-white/10" />
+                </div>
+              )}
+              
+              {/* Opção: Câmera Frontal */}
+              <button
+                onClick={() => startCamera(true)}
+                className="w-full p-4 bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-500/30 rounded-xl flex items-center gap-4 transition-colors"
+              >
+                <div className="w-12 h-12 bg-cyan-500/30 rounded-xl flex items-center justify-center">
+                  <span className="text-2xl">🤳</span>
+                </div>
+                <div className="text-left flex-1">
+                  <p className="font-bold text-cyan-400">Câmera Frontal</p>
+                  <p className="text-white/50 text-sm">Selfie / Frente do dispositivo</p>
+                </div>
+              </button>
+              
+              {/* Opção: Câmera Traseira */}
+              <button
+                onClick={() => startCamera(false)}
+                className="w-full p-4 bg-green-500/20 hover:bg-green-500/30 border border-green-500/30 rounded-xl flex items-center gap-4 transition-colors"
+              >
+                <div className="w-12 h-12 bg-green-500/30 rounded-xl flex items-center justify-center">
+                  <span className="text-2xl">📷</span>
+                </div>
+                <div className="text-left flex-1">
+                  <p className="font-bold text-green-400">Câmera Traseira</p>
+                  <p className="text-white/50 text-sm">Principal / Atrás do dispositivo</p>
+                </div>
+              </button>
+              
+              {/* Mostrar câmeras detectadas se houver mais de 2 */}
+              {availableCameras.length > 2 && (
+                <div className="pt-2 border-t border-white/10">
+                  <p className="text-white/40 text-xs mb-2">Câmeras detectadas ({availableCameras.length}):</p>
+                  <div className="space-y-1">
+                    {availableCameras.map((cam, idx) => (
+                      <button
+                        key={cam.deviceId}
+                        onClick={() => startCamera(true, cam.deviceId)}
+                        className="w-full p-2 bg-white/5 hover:bg-white/10 rounded-lg text-left text-xs transition-colors"
+                      >
+                        📷 {cam.label || `Câmera ${idx + 1}`}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+              
+              {/* Divisor */}
+              <div className="flex items-center gap-3 py-2">
+                <div className="flex-1 h-px bg-white/10" />
+                <span className="text-xs text-white/30">ou</span>
+                <div className="flex-1 h-px bg-white/10" />
+              </div>
+              
+              {/* Opção: Escolher arquivo */}
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="w-full p-4 bg-purple-500/20 hover:bg-purple-500/30 border border-purple-500/30 rounded-xl flex items-center gap-4 transition-colors"
+              >
+                <div className="w-12 h-12 bg-purple-500/30 rounded-xl flex items-center justify-center">
+                  <span className="text-2xl">📁</span>
+                </div>
+                <div className="text-left">
+                  <p className="font-bold text-purple-400">Escolher Arquivo</p>
+                  <p className="text-white/50 text-sm">Selecionar da galeria</p>
+                </div>
+              </button>
+              <input ref={fileInputRef} type="file" accept="image/*" className="hidden" onChange={handleFileSelect} />
+            </div>
+          )}
+
+          {mode === 'camera' && (
+            <div className="space-y-4">
+              <div className="relative aspect-[4/3] bg-black rounded-xl overflow-hidden">
+                <video 
+                  ref={videoRef} 
+                  autoPlay 
+                  playsInline 
+                  muted 
+                  className="w-full h-full object-cover" 
+                  style={{ transform: useFrontCamera ? 'scaleX(-1)' : 'none' }} 
+                />
+                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                  <div className="w-40 h-48 border-2 border-white/30 rounded-2xl" />
+                </div>
+                
+                {/* Botão trocar câmera */}
+                <button
+                  onClick={switchCamera}
+                  className="absolute top-3 right-3 px-3 py-2 bg-black/60 hover:bg-black/80 rounded-lg flex items-center gap-2 transition-colors"
+                  title={availableCameras.length > 1 ? 'Trocar câmera' : 'Alternar frontal/traseira'}
+                >
+                  <span>🔄</span>
+                  <span className="text-xs text-white/80">Trocar</span>
+                </button>
+                
+                {/* Indicador de câmera */}
+                <div className="absolute top-3 left-3 px-2 py-1 bg-black/60 rounded-lg text-xs text-white/80 flex items-center gap-1">
+                  {useFrontCamera ? '🤳 Frontal' : '📷 Traseira'}
+                  {availableCameras.length > 1 && (
+                    <span className="text-white/40 ml-1">({availableCameras.length} câmeras)</span>
+                  )}
+                </div>
+              </div>
+              <div className="flex gap-3">
+                <button onClick={reset} className="flex-1 py-3 bg-white/10 hover:bg-white/20 rounded-xl font-medium transition-colors">Cancelar</button>
+                <button onClick={capturePhoto} className="flex-1 py-3 bg-cyan-500 hover:bg-cyan-400 text-white rounded-xl font-bold transition-colors flex items-center justify-center gap-2">
+                  📸 Capturar
+                </button>
+              </div>
+            </div>
+          )}
+
+          {mode === 'preview' && capturedImage && !success && (
+            <div className="space-y-4">
+              <div className="relative aspect-[4/3] bg-black rounded-xl overflow-hidden">
+                <img src={capturedImage} alt="Preview" className="w-full h-full object-cover" />
+              </div>
+              <div className="flex gap-3">
+                <button onClick={reset} disabled={uploading} className="flex-1 py-3 bg-white/10 hover:bg-white/20 rounded-xl font-medium transition-colors disabled:opacity-50">
+                  Tirar Outra
+                </button>
+                <button onClick={uploadPhoto} disabled={uploading} className="flex-1 py-3 bg-green-500 hover:bg-green-400 text-white rounded-xl font-bold transition-colors flex items-center justify-center gap-2 disabled:opacity-50">
+                  {uploading ? <><span className="animate-spin">⏳</span> Salvando...</> : <>✅ Salvar Foto</>}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <canvas ref={canvasRef} className="hidden" />
+      </motion.div>
+    </motion.div>
   );
 }
 
@@ -4211,6 +5350,38 @@ function WorkoutDetailsPanel({
     ? Math.ceil((validUntil.getTime() - Date.now()) / (1000 * 60 * 60 * 24))
     : null;
 
+  // CORREÇÃO: Usar seriesCompletoV2 se series não tiver itens completos
+  const getSeries = () => {
+    // Primeiro, verificar se series tem exercícios completos
+    const series = workout.series || [];
+    const temExerciciosCompletos = series.some((s: any) => 
+      s.itens?.some((i: any) => 
+        i.nomeExercicio || i.nome || i.exercicio || i.descricao || i.nomeExercicioEvo
+      )
+    );
+
+    if (temExerciciosCompletos) {
+      return series;
+    }
+
+    // Se não, tentar seriesCompletoV2
+    const seriesV2 = workout.seriesCompletoV2 || [];
+    if (seriesV2.length > 0) {
+      // Converter estrutura V2 para formato esperado
+      return seriesV2.map((sv2: any, idx: number) => ({
+        idSerie: sv2.idSerie || idx,
+        ordem: sv2.ordem || idx + 1,
+        nome: sv2.nome || sv2.nomeSerie || `Série ${idx + 1}`,
+        itens: sv2.exercicios || sv2.itens || [],
+      }));
+    }
+
+    // Fallback para series original mesmo sem exercícios completos
+    return series;
+  };
+
+  const seriesParaExibir = getSeries();
+
   return (
     <motion.div
       initial={{ opacity: 0, y: -10 }}
@@ -4228,6 +5399,7 @@ function WorkoutDetailsPanel({
         <div className="flex-1">
           <p className="font-bold text-lg">{workout.nomeTreino}</p>
           {workout.nomeProfessor && <p className="text-xs text-white/50">Prof. {workout.nomeProfessor}</p>}
+          {workout.objetivo && <p className="text-xs text-cyan-400/70">🎯 {workout.objetivo}</p>}
         </div>
       </div>
 
@@ -4264,18 +5436,20 @@ function WorkoutDetailsPanel({
       )}
 
       {/* Séries */}
-      {workout.series && workout.series.length > 0 && (
+      {seriesParaExibir && seriesParaExibir.length > 0 && (
         <div>
           <p className="text-[10px] text-white/40 font-bold px-4 py-2 bg-white/5">
-            SÉRIES ({workout.series.length})
+            SÉRIES ({seriesParaExibir.length})
           </p>
-          {workout.series.map((serie: any, sIdx: number) => {
-            const isExpanded = expandedSeries === serie.idSerie;
+          {seriesParaExibir.map((serie: any, sIdx: number) => {
+            const serieId = serie.idSerie || sIdx;
+            const isExpanded = expandedSeries === serieId;
+            const itens = serie.itens || serie.exercicios || [];
             
             return (
-              <div key={serie.idSerie || sIdx} className="border-t border-white/5">
+              <div key={serieId} className="border-t border-white/5">
                 <button
-                  onClick={() => setExpandedSeries(isExpanded ? null : serie.idSerie)}
+                  onClick={() => setExpandedSeries(isExpanded ? null : serieId)}
                   className="w-full p-3 flex items-center justify-between hover:bg-white/5"
                 >
                   <div className="flex items-center gap-2">
@@ -4285,30 +5459,99 @@ function WorkoutDetailsPanel({
                     <span className="font-medium text-sm">{serie.nome || `Série ${sIdx + 1}`}</span>
                   </div>
                   <div className="flex items-center gap-2">
-                    <span className="text-xs text-white/40">{serie.itens?.length || 0} ex.</span>
+                    <span className="text-xs text-white/40">{itens.length || 0} ex.</span>
                     <span className={`transition-transform text-white/40 ${isExpanded ? 'rotate-180' : ''}`}>▼</span>
                   </div>
                 </button>
 
-                {isExpanded && serie.itens && (
+                {isExpanded && itens.length > 0 && (
                   <div className="bg-black/40 divide-y divide-white/5">
-                    {serie.itens.map((item: any, iIdx: number) => (
-                      <div key={item.idItem || iIdx} className="p-3 pl-12">
-                        <div className="flex items-start justify-between gap-3">
-                          <div className="flex-1 min-w-0">
-                            <p className="font-medium text-sm">{item.nomeExercicio || item.nome || `Exercício ${iIdx + 1}`}</p>
-                            {item.grupoMuscular && <p className="text-[10px] text-white/40">{item.grupoMuscular}</p>}
+                    {itens.map((item: any, iIdx: number) => {
+                      // CORREÇÃO: Tentar TODOS os campos possíveis da API do EVO
+                      const nomeExercicio = 
+                        item.nomeExercicio || 
+                        item.nomeExercicioEvo ||
+                        item.nome || 
+                        item.exercicio ||  // Campo correto do EVO
+                        item.descricao || 
+                        item.name ||
+                        item.nomeEquipamento ||
+                        item.Exercicio ||
+                        item.NomeExercicio ||
+                        `Exercício ${iIdx + 1}`;
+                      
+                      const series = 
+                        item.series || 
+                        item.qtdSeries || 
+                        item.quantidadeSeries || 
+                        item.Sets || 
+                        item.set ||
+                        item.numeroSeries ||
+                        item.vezes ||  // Campo do EVO (ex: "10 MIN")
+                        '-';
+                      
+                      const repeticoes = 
+                        item.repeticoes || 
+                        item.repeticao ||  // Campo do EVO (singular!)
+                        item.qtdRepeticoes || 
+                        item.quantidadeRepeticoes || 
+                        item.reps || 
+                        item.Reps ||
+                        item.numeroRepeticoes ||
+                        item.minRepeticoes ||
+                        '-';
+                      
+                      const carga = 
+                        item.carga || 
+                        item.peso || 
+                        item.weight || 
+                        item.load ||
+                        item.cargaKg ||
+                        '';
+                      
+                      const grupoMuscular = 
+                        item.grupoMuscular || 
+                        item.musculo || 
+                        item.muscle ||
+                        item.grupamentoMuscular ||
+                        item.categoria ||
+                        '';
+                      
+                      const observacao = 
+                        item.observacao || 
+                        item.obs || 
+                        item.nota || 
+                        item.note ||
+                        item.descricaoExercicio ||
+                        '';
+                      
+                      const intervalo = item.intervalo || item.descanso || item.rest || '';
+                      
+                      return (
+                        <div key={item.idItem || item.id || item.idExercicio || iIdx} className="p-3 pl-12">
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="flex-1 min-w-0">
+                              <p className="font-medium text-sm">{nomeExercicio}</p>
+                              {grupoMuscular && <p className="text-[10px] text-white/40">{grupoMuscular}</p>}
+                            </div>
+                            <div className="text-right">
+                              <p className="font-bold text-green-400">{series} x {repeticoes}</p>
+                              {carga && <p className="text-xs text-cyan-400">{carga}kg</p>}
+                              {intervalo && <p className="text-[10px] text-white/30">⏱ {intervalo}s</p>}
+                            </div>
                           </div>
-                          <div className="text-right">
-                            <p className="font-bold text-green-400">{item.series || '-'} x {item.repeticoes || '-'}</p>
-                            {item.carga && <p className="text-xs text-cyan-400">{item.carga}</p>}
-                          </div>
+                          {observacao && (
+                            <p className="text-[10px] text-white/50 mt-1">💬 {observacao}</p>
+                          )}
                         </div>
-                        {item.observacao && (
-                          <p className="text-[10px] text-white/50 mt-1">💬 {item.observacao}</p>
-                        )}
-                      </div>
-                    ))}
+                      );
+                    })}
+                  </div>
+                )}
+
+                {isExpanded && itens.length === 0 && (
+                  <div className="p-4 text-center text-white/40 text-sm bg-black/40">
+                    Nenhum exercício cadastrado nesta série
                   </div>
                 )}
               </div>
@@ -4317,9 +5560,25 @@ function WorkoutDetailsPanel({
         </div>
       )}
 
-      {(!workout.series || workout.series.length === 0) && (
+      {(!seriesParaExibir || seriesParaExibir.length === 0) && (
         <div className="p-6 text-center text-white/40 text-sm">
           Nenhuma série cadastrada neste treino
+        </div>
+      )}
+
+      {/* Aviso para treinos V2 sem exercícios */}
+      {workout.flTreinoV2 && seriesParaExibir?.length > 0 && !seriesParaExibir.some((s: any) => (s.itens?.length || 0) > 0) && (
+        <div className="p-4 bg-yellow-500/10 border-t border-yellow-500/20">
+          <div className="flex items-start gap-3">
+            <span className="text-xl">⚠️</span>
+            <div>
+              <p className="text-yellow-400 font-medium text-sm">Treino em formato V2</p>
+              <p className="text-white/50 text-xs mt-1">
+                Os exercícios deste treino não estão disponíveis para visualização via API.
+                Consulte o treino diretamente no sistema EVO.
+              </p>
+            </div>
+          </div>
         </div>
       )}
     </motion.div>

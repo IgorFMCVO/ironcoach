@@ -6,6 +6,245 @@
 import { Priority } from '@/types';
 
 // ============================================================================
+// SISTEMA DE ALERTAS DE AMBIENTE - CONFIGURAÇÕES
+// ============================================================================
+
+export type NivelAtendimento = 'OTIMO' | 'BOM' | 'BAIXO' | 'CRITICO';
+
+export interface EnvironmentConfig {
+  // Ratios de capacidade (alunos por professor)
+  ratioOtimo: number;
+  ratioBom: number;
+  ratioBaixo: number;
+  
+  // Tempos base em segundos (nível ÓTIMO)
+  tempoBaseVermelho: number;
+  tempoBaseLaranja: number;
+  tempoBaseAmarelo: number;
+  tempoBaseVerde: number;
+  
+  // Ajustes por nível (em segundos)
+  ajusteVermelhoLaranja: number;
+  ajusteAmareloVerde: number;
+  
+  // Alertas de fila
+  cardsParaAlerta: number;
+  tempoFilaOtimo: number;
+  tempoFilaBom: number;
+  tempoFilaBaixo: number;
+  tempoFilaCritico: number;
+  
+  // Frequência de alertas fullscreen (em minutos)
+  alertaFreqOtimo: number;
+  alertaFreqBom: number;
+  alertaFreqBaixo: number;
+  alertaFreqCritico: number;
+  
+  // Duração do alerta fullscreen (em segundos)
+  alertaDuracaoOtimo: number;
+  alertaDuracaoBom: number;
+  alertaDuracaoBaixo: number;
+  alertaDuracaoCritico: number;
+  
+  // WhatsApp do supervisor
+  supervisorWhatsapp?: string;
+}
+
+export interface EnvironmentStatus {
+  nivel: NivelAtendimento;
+  nivelCapacidade: NivelAtendimento;
+  nivelFila: NivelAtendimento;
+  
+  // Métricas
+  alunosAtivos: number;
+  professoresOnline: number;
+  ratio: number;
+  
+  // Alertas de fila
+  cardsEsperandoOtimo: number;
+  cardsEsperandoBom: number;
+  cardsEsperandoBaixo: number;
+  cardsEsperandoCritico: number;
+  
+  // Tempos ajustados atuais (em segundos)
+  tempoVermelho: number;
+  tempoLaranja: number;
+  tempoAmarelo: number;
+  tempoVerde: number;
+  
+  // Alertas
+  ultimoAlerta: Date | null;
+  proximoAlerta: Date | null;
+}
+
+export const DEFAULT_ENVIRONMENT_CONFIG: EnvironmentConfig = {
+  ratioOtimo: 5,
+  ratioBom: 10,
+  ratioBaixo: 15,
+  
+  tempoBaseVermelho: 210,  // 3:30
+  tempoBaseLaranja: 270,   // 4:30
+  tempoBaseAmarelo: 330,   // 5:30
+  tempoBaseVerde: 390,     // 6:30
+  
+  ajusteVermelhoLaranja: 30,
+  ajusteAmareloVerde: 15,
+  
+  cardsParaAlerta: 5,
+  tempoFilaOtimo: 30,
+  tempoFilaBom: 60,
+  tempoFilaBaixo: 120,
+  tempoFilaCritico: 300,
+  
+  alertaFreqOtimo: 15,
+  alertaFreqBom: 10,
+  alertaFreqBaixo: 5,
+  alertaFreqCritico: 3,
+  
+  alertaDuracaoOtimo: 2,
+  alertaDuracaoBom: 2,
+  alertaDuracaoBaixo: 3,
+  alertaDuracaoCritico: 4,
+};
+
+export const NIVEL_CONFIG: Record<NivelAtendimento, {
+  label: string;
+  emoji: string;
+  color: string;
+  bgColor: string;
+  borderColor: string;
+  mensagem: string;
+  acao: string;
+}> = {
+  OTIMO: {
+    label: 'ÓTIMO',
+    emoji: '💚',
+    color: '#30D158',
+    bgColor: 'rgba(48, 209, 88, 0.15)',
+    borderColor: 'rgba(48, 209, 88, 0.5)',
+    mensagem: 'Excelente trabalho!',
+    acao: 'Mantenha a qualidade',
+  },
+  BOM: {
+    label: 'BOM',
+    emoji: '💛',
+    color: '#FFCC00',
+    bgColor: 'rgba(255, 204, 0, 0.15)',
+    borderColor: 'rgba(255, 204, 0, 0.5)',
+    mensagem: 'Bom ritmo de atendimento',
+    acao: 'Mantenha o foco',
+  },
+  BAIXO: {
+    label: 'BAIXO',
+    emoji: '🟠',
+    color: '#FF9500',
+    bgColor: 'rgba(255, 149, 0, 0.15)',
+    borderColor: 'rgba(255, 149, 0, 0.5)',
+    mensagem: 'Atenção: Alta demanda',
+    acao: 'Priorize alunos críticos',
+  },
+  CRITICO: {
+    label: 'CRÍTICO',
+    emoji: '🔴',
+    color: '#FF3B30',
+    bgColor: 'rgba(255, 59, 48, 0.15)',
+    borderColor: 'rgba(255, 59, 48, 0.5)',
+    mensagem: 'REFORÇO NECESSÁRIO!',
+    acao: 'Solicite apoio imediato',
+  },
+};
+
+/**
+ * Calcula o nível de atendimento baseado no ratio
+ */
+export function calcularNivelCapacidade(
+  ratio: number,
+  config: EnvironmentConfig
+): NivelAtendimento {
+  if (ratio <= config.ratioOtimo) return 'OTIMO';
+  if (ratio <= config.ratioBom) return 'BOM';
+  if (ratio <= config.ratioBaixo) return 'BAIXO';
+  return 'CRITICO';
+}
+
+/**
+ * Calcula o nível de atendimento baseado na fila
+ */
+export function calcularNivelFila(
+  cardsOtimo: number,
+  cardsBom: number,
+  cardsBaixo: number,
+  cardsCritico: number,
+  config: EnvironmentConfig
+): NivelAtendimento {
+  if (cardsCritico >= config.cardsParaAlerta) return 'CRITICO';
+  if (cardsBaixo >= config.cardsParaAlerta) return 'BAIXO';
+  if (cardsBom >= config.cardsParaAlerta) return 'BOM';
+  return 'OTIMO';
+}
+
+/**
+ * Retorna o pior nível entre dois
+ */
+export function getPiorNivel(a: NivelAtendimento, b: NivelAtendimento): NivelAtendimento {
+  const ordem: Record<NivelAtendimento, number> = {
+    OTIMO: 0,
+    BOM: 1,
+    BAIXO: 2,
+    CRITICO: 3,
+  };
+  return ordem[a] >= ordem[b] ? a : b;
+}
+
+/**
+ * Calcula os tempos ajustados baseado no nível
+ */
+export function calcularTemposAjustados(
+  nivel: NivelAtendimento,
+  config: EnvironmentConfig
+): { vermelho: number; laranja: number; amarelo: number; verde: number } {
+  const nivelIndex: Record<NivelAtendimento, number> = {
+    OTIMO: 0,
+    BOM: 1,
+    BAIXO: 2,
+    CRITICO: 3,
+  };
+  
+  const multiplicador = nivelIndex[nivel];
+  
+  return {
+    vermelho: config.tempoBaseVermelho - (config.ajusteVermelhoLaranja * multiplicador),
+    laranja: config.tempoBaseLaranja - (config.ajusteVermelhoLaranja * multiplicador),
+    amarelo: config.tempoBaseAmarelo - (config.ajusteAmareloVerde * multiplicador),
+    verde: config.tempoBaseVerde - (config.ajusteAmareloVerde * multiplicador),
+  };
+}
+
+/**
+ * Retorna a frequência de alerta em minutos para o nível
+ */
+export function getAlertaFrequencia(nivel: NivelAtendimento, config: EnvironmentConfig): number {
+  switch (nivel) {
+    case 'OTIMO': return config.alertaFreqOtimo;
+    case 'BOM': return config.alertaFreqBom;
+    case 'BAIXO': return config.alertaFreqBaixo;
+    case 'CRITICO': return config.alertaFreqCritico;
+  }
+}
+
+/**
+ * Retorna a duração do alerta em segundos para o nível
+ */
+export function getAlertaDuracao(nivel: NivelAtendimento, config: EnvironmentConfig): number {
+  switch (nivel) {
+    case 'OTIMO': return config.alertaDuracaoOtimo;
+    case 'BOM': return config.alertaDuracaoBom;
+    case 'BAIXO': return config.alertaDuracaoBaixo;
+    case 'CRITICO': return config.alertaDuracaoCritico;
+  }
+}
+
+// ============================================================================
 // PRIORIDADES E CORES
 // ============================================================================
 
