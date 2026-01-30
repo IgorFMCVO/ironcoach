@@ -4,6 +4,7 @@
 // IRON COACH - Página de Administração
 // - Gerenciamento de usuários (coaches)
 // - Configurações do sistema (tempos, alertas, etc)
+// - v16: Sistema PURPLE/BLACK para Personal/Consultoria
 // ============================================================================
 
 'use client';
@@ -12,6 +13,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import Link from 'next/link';
 import { supabase, getCoachSession } from '@/lib/supabase';
+import AdminEnvironmentConfig from './components/AdminEnvironmentConfig';
 
 // ============================================================================
 // TYPES
@@ -47,13 +49,15 @@ interface SystemConfig {
   vibrationEnabled: boolean;
 }
 
+// v16: Atualizado com PURPLE para Personal Trainer
 const PRIORITY_INFO: Record<string, { color: string; label: string; emoji: string; description: string }> = {
   RED: { color: '#FF3B30', label: 'Máxima', emoji: '🔴', description: '1ª semana (0-7 dias)' },
   ORANGE: { color: '#FF9500', label: 'Alta', emoji: '🟠', description: '2ª semana (8-14 dias)' },
   YELLOW: { color: '#FFCC00', label: 'Moderada', emoji: '🟡', description: 'Mês 1 (15-30 dias)' },
-  GREEN: { color: '#30D158', label: 'Normal', emoji: '🟢', description: 'Veterano (31+ dias)' },
+  GREEN: { color: '#30D158', label: 'Normal', emoji: '🟢', description: 'Veterano (31-179 dias)' },
   BLUE: { color: '#007AFF', label: 'Autônomo', emoji: '🔵', description: 'Veterano autônomo (180+ dias)' },
-  BLACK: { color: '#8E8E93', label: 'Personal', emoji: '⚫', description: 'Personal/Consultoria' },
+  PURPLE: { color: '#AF52DE', label: 'Personal', emoji: '🟣', description: 'Aluno de Personal Trainer' },
+  BLACK: { color: '#8E8E93', label: 'Consultoria', emoji: '⚫', description: 'Consultoria/EVO automático' },
 };
 
 // ============================================================================
@@ -67,7 +71,7 @@ export default function AdminPage() {
   const [showAddModal, setShowAddModal] = useState(false);
   const [editingCoach, setEditingCoach] = useState<Coach | null>(null);
   const [showPins, setShowPins] = useState(false);
-  const [activeTab, setActiveTab] = useState<'users' | 'config'>('users');
+  const [activeTab, setActiveTab] = useState<'users' | 'config' | 'ambiente'>('users');
   
   // Configurações
   const [config, setConfig] = useState<SystemConfig | null>(null);
@@ -380,6 +384,16 @@ export default function AdminPage() {
           >
             ⚙️ Configurações
           </button>
+          <button
+            onClick={() => setActiveTab('ambiente')}
+            className={`px-6 py-4 font-medium text-sm transition-all border-b-2 ${
+              activeTab === 'ambiente'
+                ? 'border-green-400 text-green-400'
+                : 'border-transparent text-white/40 hover:text-white/60'
+            }`}
+          >
+            🚦 Ambiente
+          </button>
         </div>
       </div>
 
@@ -505,6 +519,29 @@ export default function AdminPage() {
                     )}
                   </AnimatePresence>
 
+                  {/* Legenda das Prioridades v16 */}
+                  <div className="bg-purple-500/10 border border-purple-500/30 rounded-xl p-4">
+                    <h4 className="font-bold text-purple-400 mb-2">🟣 Sistema de Prioridades v16</h4>
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-sm">
+                      <div className="flex items-center gap-2">
+                        <span>🔴🟠🟡🟢</span>
+                        <span className="text-white/60">Fila regular (com timer/alertas)</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span>🔵</span>
+                        <span className="text-white/60">Veterano 180+ dias (com alertas)</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span>🟣</span>
+                        <span className="text-purple-400">Personal (seção separada, sem alertas)</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span>⚫</span>
+                        <span className="text-white/40">Consultoria/EVO (seção separada)</span>
+                      </div>
+                    </div>
+                  </div>
+
                   {/* Seção: Tempo de Atendimento */}
                   <div className="bg-white/5 rounded-xl border border-white/10 p-6">
                     <h3 className="text-lg font-bold mb-2 flex items-center gap-2">
@@ -514,10 +551,12 @@ export default function AdminPage() {
                       Duração do cronômetro regressivo em <strong className="text-white">SEGUNDOS</strong> quando o professor abre o card para atendimento
                     </p>
                     
-                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                      {['RED', 'ORANGE', 'YELLOW', 'GREEN', 'BLUE', 'BLACK'].map((priority) => {
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                      {/* v16: Incluir PURPLE na lista */}
+                      {['RED', 'ORANGE', 'YELLOW', 'GREEN', 'BLUE', 'PURPLE', 'BLACK'].map((priority) => {
                         const info = PRIORITY_INFO[priority];
-                        const isEditable = priority !== 'BLUE' && priority !== 'BLACK';
+                        // v16: BLUE, PURPLE e BLACK não são editáveis
+                        const isEditable = priority !== 'BLUE' && priority !== 'PURPLE' && priority !== 'BLACK';
                         
                         return (
                           <div
@@ -546,7 +585,11 @@ export default function AdminPage() {
                                 <span className="text-white/40">segundos</span>
                               </div>
                             ) : (
-                              <p className="text-white/30 text-sm">Sem cronômetro</p>
+                              <p className="text-white/30 text-sm italic">
+                                {priority === 'PURPLE' ? '🟣 Seção Personal (sem timer)' : 
+                                 priority === 'BLACK' ? '⚫ Seção Consultoria (sem timer)' :
+                                 '🔵 Veterano autônomo'}
+                              </p>
                             )}
                           </div>
                         );
@@ -563,10 +606,12 @@ export default function AdminPage() {
                       Tempo sem atendimento para o card começar a "gritar" pedindo atenção (timer negativo)
                     </p>
                     
-                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                      {['RED', 'ORANGE', 'YELLOW', 'GREEN', 'BLUE', 'BLACK'].map((priority) => {
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                      {/* v16: Incluir PURPLE na lista */}
+                      {['RED', 'ORANGE', 'YELLOW', 'GREEN', 'BLUE', 'PURPLE', 'BLACK'].map((priority) => {
                         const info = PRIORITY_INFO[priority];
-                        const isEditable = priority !== 'BLUE' && priority !== 'BLACK';
+                        // v16: BLUE, PURPLE e BLACK não são editáveis
+                        const isEditable = priority !== 'BLUE' && priority !== 'PURPLE' && priority !== 'BLACK';
                         
                         return (
                           <div
@@ -595,7 +640,11 @@ export default function AdminPage() {
                                 <span className="text-white/40">minutos</span>
                               </div>
                             ) : (
-                              <p className="text-white/30 text-sm">Sem alerta</p>
+                              <p className="text-white/30 text-sm italic">
+                                {priority === 'PURPLE' ? '🟣 Seção Personal (sem alerta)' : 
+                                 priority === 'BLACK' ? '⚫ Seção Consultoria (sem alerta)' :
+                                 '🔵 Veterano autônomo'}
+                              </p>
                             )}
                           </div>
                         );
@@ -770,6 +819,17 @@ export default function AdminPage() {
                   </button>
                 </div>
               )}
+            </motion.div>
+          )}
+
+          {activeTab === 'ambiente' && (
+            <motion.div
+              key="ambiente"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+            >
+              <AdminEnvironmentConfig />
             </motion.div>
           )}
         </AnimatePresence>

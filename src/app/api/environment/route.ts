@@ -1,191 +1,118 @@
 // ============================================================================
-// API: Sistema de Alertas de Ambiente
-// GET /api/environment - Buscar configuração e status
-// POST /api/environment - Atualizar configuração
-// PUT /api/environment - Atualizar status do coach no salão
+// CAMINHO: src/app/api/environment/route.ts
 // ============================================================================
 
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 
-export const dynamic = 'force-dynamic';
-
 const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL || '',
-  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || ''
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
 );
 
-// GET - Buscar configuração e coaches no salão
+type EnvironmentLevel = 'OTIMO' | 'BOM' | 'BAIXO' | 'CRITICO';
+type PriorityColor = 'RED' | 'ORANGE' | 'YELLOW' | 'GREEN' | 'BLUE' | 'PURPLE' | 'BLACK';
+
+// GET - Buscar status do ambiente ou configurações
 export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url);
-    const gymId = searchParams.get('gymId') || 'default';
-    
-    // Buscar configuração
-    const { data: configData, error: configError } = await supabase.rpc('get_environment_config', {
-      p_gym_id: gymId
-    });
-    
-    if (configError) {
-      console.error('Erro ao buscar config:', configError);
+    const type = searchParams.get('type');
+    const gymId = searchParams.get('gymId') || 'impacto';
+
+    // Retornar configurações
+    if (type === 'config') {
+      const { data, error } = await supabase
+        .from('environment_config')
+        .select('*')
+        .eq('gym_id', gymId)
+        .single();
+
+      if (error && error.code !== 'PGRST116') throw error;
+
+      return NextResponse.json({ success: true, config: data });
     }
-    
-    // Buscar coaches no salão
-    const { data: coachesData, error: coachesError } = await supabase.rpc('count_coaches_on_floor');
-    
-    if (coachesError) {
-      console.error('Erro ao buscar coaches:', coachesError);
-    }
-    
-    // Buscar todos os coaches para saber quem está disponível
-    const { data: allCoaches, error: allCoachesError } = await supabase
-      .from('coach_floor_status')
+
+    // Buscar status do ambiente via função SQL
+    const { data: statusData, error: statusError } = await supabase
+      .rpc('calculate_environment_status', { p_gym_id: gymId });
+
+    if (statusError) throw statusError;
+
+    // Buscar config para ajustes
+    const { data: config } = await supabase
+      .from('environment_config')
       .select('*')
-      .order('coach_name');
-    
+      .eq('gym_id', gymId)
+      .single();
+
+    const level = (statusData?.nivel || 'OTIMO') as EnvironmentLevel;
+
+    // Calcular ajustes por cor baseado no nível atual
+    const getAdjustment = (color: PriorityColor): number => {
+      if (color === 'PURPLE' || color === 'BLACK') return 0;
+      const key = `ajuste_${color.toLowerCase()}_${level.toLowerCase()}`;
+      return (config as any)?.[key] || 0;
+    };
+
+    const adjustments: Record<string, number> = {
+      RED: getAdjustment('RED'),
+      ORANGE: getAdjustment('ORANGE'),
+      YELLOW: getAdjustment('YELLOW'),
+      GREEN: getAdjustment('GREEN'),
+      BLUE: getAdjustment('BLUE'),
+      PURPLE: 0,
+      BLACK: 0
+    };
+
+    // Frequência de alerta baseada no nível
+    const alertFrequency = {
+      OTIMO: config?.alerta_freq_otimo || 15,
+      BOM: config?.alerta_freq_bom || 10,
+      BAIXO: config?.alerta_freq_baixo || 5,
+      CRITICO: config?.alerta_freq_critico || 3
+    }[level];
+
     return NextResponse.json({
       success: true,
-      config: configData || {},
-      coachesOnFloor: coachesData?.count || 0,
-      coaches: coachesData?.coaches || [],
-      allCoaches: allCoaches || [],
+      environment: {
+        level,
+        ...statusData,
+        adjustments,
+        alertFrequency
+      }
     });
-    
+
   } catch (error) {
-    console.error('Erro no GET /api/environment:', error);
-    return NextResponse.json({ 
-      success: false, 
-      error: String(error) 
-    }, { status: 500 });
+    console.error('Erro na API environment:', error);
+    return NextResponse.json({ success: false, error: 'Erro interno' }, { status: 500 });
   }
 }
 
-// POST - Salvar configuração
+// POST - Atualizar configurações
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { gymId = 'default', config } = body;
-    
-    const { data, error } = await supabase.rpc('save_environment_config', {
-      p_gym_id: gymId,
-      p_config: config
-    });
-    
-    if (error) {
-      return NextResponse.json({ 
-        success: false, 
-        error: error.message 
-      }, { status: 500 });
-    }
-    
-    return NextResponse.json({
-      success: true,
-      message: 'Configuração salva com sucesso'
-    });
-    
-  } catch (error) {
-    console.error('Erro no POST /api/environment:', error);
-    return NextResponse.json({ 
-      success: false, 
-      error: String(error) 
-    }, { status: 500 });
-  }
-}
+    const { action, config, gymId = 'impacto' } = body;
 
-// PUT - Atualizar status do coach no salão (entrar/sair)
-export async function PUT(request: NextRequest) {
-  try {
-    const body = await request.json();
-    const { coachId, coachName, role, isOnFloor } = body;
-    
-    if (!coachId || !coachName) {
-      return NextResponse.json({ 
-        success: false, 
-        error: 'coachId e coachName são obrigatórios' 
-      }, { status: 400 });
-    }
-    
-    const { data, error } = await supabase.rpc('set_coach_floor_status', {
-      p_coach_id: coachId,
-      p_coach_name: coachName,
-      p_role: role || 'PROFESSOR',
-      p_is_on_floor: isOnFloor
-    });
-    
-    if (error) {
-      return NextResponse.json({ 
-        success: false, 
-        error: error.message 
-      }, { status: 500 });
-    }
-    
-    // Se for crítico e supervisor entrou como reforço, notificar
-    // (lógica de WhatsApp pode ser adicionada aqui futuramente)
-    
-    return NextResponse.json({
-      success: true,
-      message: isOnFloor ? 'Entrou no salão' : 'Saiu do salão',
-      data
-    });
-    
-  } catch (error) {
-    console.error('Erro no PUT /api/environment:', error);
-    return NextResponse.json({ 
-      success: false, 
-      error: String(error) 
-    }, { status: 500 });
-  }
-}
+    if (action === 'updateConfig') {
+      const { error } = await supabase
+        .from('environment_config')
+        .upsert({
+          gym_id: gymId,
+          ...config,
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'gym_id' });
 
-// PATCH - Registrar alerta no histórico
-export async function PATCH(request: NextRequest) {
-  try {
-    const body = await request.json();
-    const { 
-      nivel, 
-      alunosAtivos, 
-      professoresOnline, 
-      ratio,
-      cardsOtimo,
-      cardsBom,
-      cardsBaixo,
-      cardsCritico,
-      tempoVermelho,
-      tempoLaranja,
-      tempoAmarelo,
-      tempoVerde,
-      alertaTipo
-    } = body;
-    
-    const { data, error } = await supabase.rpc('log_environment_alert', {
-      p_nivel: nivel,
-      p_alunos_ativos: alunosAtivos,
-      p_professores_online: professoresOnline,
-      p_ratio: ratio,
-      p_cards_otimo: cardsOtimo,
-      p_cards_bom: cardsBom,
-      p_cards_baixo: cardsBaixo,
-      p_cards_critico: cardsCritico,
-      p_tempo_vermelho: tempoVermelho,
-      p_tempo_laranja: tempoLaranja,
-      p_tempo_amarelo: tempoAmarelo,
-      p_tempo_verde: tempoVerde,
-      p_alerta_tipo: alertaTipo
-    });
-    
-    if (error) {
-      console.error('Erro ao registrar alerta:', error);
+      if (error) throw error;
+
+      return NextResponse.json({ success: true, message: 'Configurações atualizadas' });
     }
-    
-    return NextResponse.json({
-      success: true
-    });
-    
+
+    return NextResponse.json({ success: false, error: 'Ação inválida' }, { status: 400 });
+
   } catch (error) {
-    console.error('Erro no PATCH /api/environment:', error);
-    return NextResponse.json({ 
-      success: false, 
-      error: String(error) 
-    }, { status: 500 });
+    console.error('Erro ao atualizar config:', error);
+    return NextResponse.json({ success: false, error: 'Erro interno' }, { status: 500 });
   }
 }
