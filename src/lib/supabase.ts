@@ -23,7 +23,7 @@ export const isSupabaseConfigured = Boolean(supabaseUrl && supabaseAnonKey);
 // TYPES
 // ============================================================================
 
-export type Priority = 'RED' | 'ORANGE' | 'YELLOW' | 'BLUE' | 'GREEN' | 'BLACK';
+export type Priority = 'RED' | 'ORANGE' | 'YELLOW' | 'GREEN' | 'BLUE' | 'PURPLE' | 'BLACK';
 export type QueueStatus = 'WAITING' | 'TRAINING' | 'BEING_ATTENDED' | 'IDLE' | 'DOING_CARDIO' | 'FINISHED';
 
 export interface Coach {
@@ -95,7 +95,7 @@ export async function getQueue(): Promise<QueueMember[]> {
     return [];
   }
 
-  const priorityOrder = { RED: 0, ORANGE: 1, YELLOW: 2, BLUE: 3, GREEN: 4, BLACK: 5 };
+  const priorityOrder = { RED: 0, ORANGE: 1, YELLOW: 2, GREEN: 3, BLUE: 4, PURPLE: 5, BLACK: 6 };
   
   return (data || [])
     .map(item => ({
@@ -447,8 +447,9 @@ const PRIORITY_BONUS: Record<Priority, number> = {
   RED: 5,
   ORANGE: 3,
   YELLOW: 2,
+  GREEN: 1,
   BLUE: 1,
-  GREEN: 0,
+  PURPLE: 0,
   BLACK: 0,
 };
 
@@ -754,7 +755,7 @@ export async function getSupervisionStats(): Promise<{
  */
 export async function updateMemberPriority(
   queueId: string, 
-  newPriority: 'RED' | 'ORANGE' | 'YELLOW' | 'GREEN' | 'BLUE' | 'BLACK',
+  newPriority: Priority,
   isPersonal: boolean = false
 ): Promise<boolean> {
   // Primeiro, buscar as tags atuais

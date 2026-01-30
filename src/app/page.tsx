@@ -425,6 +425,7 @@ export default function Dashboard() {
     tempoLaranja: 270,
     tempoAmarelo: 330,
     tempoVerde: 390,
+    tempoAzul: 450,
     ultimoAlerta: null,
     proximoAlerta: null,
   });
@@ -596,6 +597,7 @@ export default function Dashboard() {
               tempoLaranja: temposAjustados.laranja,
               tempoAmarelo: temposAjustados.amarelo,
               tempoVerde: temposAjustados.verde,
+              tempoAzul: temposAjustados.azul,
               alertaTipo: nivel === 'CRITICO' ? 'BOTH' : 'FULLSCREEN'
             })
           }).catch(console.error);
@@ -641,6 +643,7 @@ export default function Dashboard() {
         tempoLaranja: temposAjustados.laranja,
         tempoAmarelo: temposAjustados.amarelo,
         tempoVerde: temposAjustados.verde,
+        tempoAzul: temposAjustados.azul,
         ultimoAlerta: lastEnvAlertRef.current,
         proximoAlerta,
       });
@@ -2529,7 +2532,7 @@ export default function Dashboard() {
               )}
               
               {/* Tempos Ajustados */}
-              <div className="flex justify-center gap-3 text-sm">
+              <div className="flex justify-center gap-3 text-sm flex-wrap">
                 <span className="px-2 py-1 rounded bg-red-500/20 text-red-400">
                   🔴 {Math.floor(envStatus.tempoVermelho / 60)}:{String(envStatus.tempoVermelho % 60).padStart(2, '0')}
                 </span>
@@ -2541,6 +2544,9 @@ export default function Dashboard() {
                 </span>
                 <span className="px-2 py-1 rounded bg-green-500/20 text-green-400">
                   🟢 {Math.floor(envStatus.tempoVerde / 60)}:{String(envStatus.tempoVerde % 60).padStart(2, '0')}
+                </span>
+                <span className="px-2 py-1 rounded bg-blue-500/20 text-blue-400">
+                  🔵 {Math.floor(envStatus.tempoAzul / 60)}:{String(envStatus.tempoAzul % 60).padStart(2, '0')}
                 </span>
               </div>
               

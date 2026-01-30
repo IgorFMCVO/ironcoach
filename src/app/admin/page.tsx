@@ -552,11 +552,11 @@ export default function AdminPage() {
                     </p>
                     
                     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-                      {/* v16: Incluir PURPLE na lista */}
+                      {/* v16: RED, ORANGE, YELLOW, GREEN, BLUE são editáveis. PURPLE e BLACK não */}
                       {['RED', 'ORANGE', 'YELLOW', 'GREEN', 'BLUE', 'PURPLE', 'BLACK'].map((priority) => {
                         const info = PRIORITY_INFO[priority];
-                        // v16: BLUE, PURPLE e BLACK não são editáveis
-                        const isEditable = priority !== 'BLUE' && priority !== 'PURPLE' && priority !== 'BLACK';
+                        // v16: Apenas PURPLE e BLACK não são editáveis (seção Personal/Consultoria)
+                        const isEditable = priority !== 'PURPLE' && priority !== 'BLACK';
                         
                         return (
                           <div
@@ -587,8 +587,7 @@ export default function AdminPage() {
                             ) : (
                               <p className="text-white/30 text-sm italic">
                                 {priority === 'PURPLE' ? '🟣 Seção Personal (sem timer)' : 
-                                 priority === 'BLACK' ? '⚫ Seção Consultoria (sem timer)' :
-                                 '🔵 Veterano autônomo'}
+                                 '⚫ Seção Consultoria (sem timer)'}
                               </p>
                             )}
                           </div>
@@ -607,11 +606,11 @@ export default function AdminPage() {
                     </p>
                     
                     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-                      {/* v16: Incluir PURPLE na lista */}
+                      {/* v16: RED, ORANGE, YELLOW, GREEN, BLUE são editáveis. PURPLE e BLACK não */}
                       {['RED', 'ORANGE', 'YELLOW', 'GREEN', 'BLUE', 'PURPLE', 'BLACK'].map((priority) => {
                         const info = PRIORITY_INFO[priority];
-                        // v16: BLUE, PURPLE e BLACK não são editáveis
-                        const isEditable = priority !== 'BLUE' && priority !== 'PURPLE' && priority !== 'BLACK';
+                        // v16: Apenas PURPLE e BLACK não são editáveis (seção Personal/Consultoria)
+                        const isEditable = priority !== 'PURPLE' && priority !== 'BLACK';
                         
                         return (
                           <div
@@ -642,8 +641,7 @@ export default function AdminPage() {
                             ) : (
                               <p className="text-white/30 text-sm italic">
                                 {priority === 'PURPLE' ? '🟣 Seção Personal (sem alerta)' : 
-                                 priority === 'BLACK' ? '⚫ Seção Consultoria (sem alerta)' :
-                                 '🔵 Veterano autônomo'}
+                                 '⚫ Seção Consultoria (sem alerta)'}
                               </p>
                             )}
                           </div>
