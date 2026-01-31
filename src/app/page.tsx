@@ -70,6 +70,7 @@ import {
   // Usuários Online
   getAllOnlineUsers,
   type CoachSession,
+  type CoachSessionData,
   type CardioMember,
   type OnlineUser,
   type OnlineUsersData,
@@ -393,7 +394,7 @@ export default function Dashboard() {
   const [isSkipping, setIsSkipping] = useState(false);
   
   // FASE 2: Multi-Professor
-  const [activeCoaches, setActiveCoaches] = useState<CoachSession[]>([]);
+  const [activeCoaches, setActiveCoaches] = useState<CoachSessionData[]>([]);
   const [suggestedMemberId, setSuggestedMemberId] = useState<string | null>(null);
   const [longAttendanceNotified, setLongAttendanceNotified] = useState(false);
   const [showPauseModal, setShowPauseModal] = useState(false);
@@ -481,24 +482,90 @@ export default function Dashboard() {
         const response = await fetch('/api/environment');
         if (response.ok) {
           const data = await response.json();
+          
           if (data.config && Object.keys(data.config).length > 0) {
+            console.log('[Environment] Config carregado do banco:', {
+              ratioOtimo: data.config.ratioOtimo || data.config.ratio_otimo,
+              ratioBom: data.config.ratioBom || data.config.ratio_bom,
+              ratioBaixo: data.config.ratioBaixo || data.config.ratio_baixo
+            });
             setEnvConfig(data.config);
+          } else {
+            console.log('[Environment] Usando config padrão - banco vazio ou sem dados');
           }
-          setCoachesOnFloor(data.coaches || []);
+          
+          // =========================================================================
+          // VERIFICAÇÃO DE SESSÃO ATIVA - Força logout se sessão foi invalidada
+          // IMPORTANTE: Só verifica após alguns segundos para dar tempo da sessão ser criada
+          // =========================================================================
+          const mySession = data.allCoaches?.find(
+            (c: any) => String(c.coach_id) === String(coach.id)
+          );
+          
+          // Só verifica force logout se a sessão deveria existir
+          // Não deslogar se for uma sessão muito recente (pode estar sendo criada)
+          if (!mySession && data.allCoaches && data.allCoaches.length > 0) {
+            // Verificar se há sessão no localStorage
+            const savedCoachStr = localStorage.getItem('iron_coach_session');
+            if (savedCoachStr) {
+              try {
+                // Verificar se é uma sessão recente (menos de 2 minutos)
+                // Se for recente, pode ser que ainda está sendo criada
+                const loginTime = localStorage.getItem('iron_coach_login_time');
+                const now = Date.now();
+                const twoMinutes = 2 * 60 * 1000;
+                
+                if (loginTime && (now - parseInt(loginTime)) < twoMinutes) {
+                  // Sessão muito recente, não fazer force logout
+                  console.log('[Environment] Sessão recente, aguardando criação no banco...');
+                } else {
+                  // Sessão não é recente mas não existe no banco = foi forçado logout
+                  console.log('[Environment] 🔴 Sessão não encontrada no banco - Force Logout detectado');
+                  localStorage.removeItem('iron_coach_session');
+                  localStorage.removeItem('iron_coach_login_time');
+                  localStorage.removeItem('coach');
+                  setCoach(null);
+                  alert('Sua sessão foi encerrada pelo administrador.');
+                  window.location.reload();
+                  return;
+                }
+              } catch (e) {
+                console.error('[Environment] Erro ao verificar sessão:', e);
+              }
+            }
+          }
+          
+          // Atualizar lista de coaches no salão
+          const coaches = data.coaches || [];
+          setCoachesOnFloor(coaches);
           
           // Verificar se este coach está no salão
+          // Comparar como string para evitar problemas de tipo
           const thisCoachOnFloor = data.allCoaches?.find(
-            (c: any) => c.coach_id === coach.id && c.is_on_floor
+            (c: any) => String(c.coach_id) === String(coach.id) && c.is_on_floor === true
           );
-          setIsCoachOnFloor(!!thisCoachOnFloor);
+          
+          const isOnFloor = !!thisCoachOnFloor;
+          setIsCoachOnFloor(isOnFloor);
+          
+          console.log('[Environment] Dados carregados:', {
+            coachesNoSalao: coaches.length,
+            allCoaches: data.allCoaches?.length || 0,
+            coachId: coach.id,
+            isOnFloor,
+            thisCoachOnFloor: thisCoachOnFloor ? 'encontrado' : 'não encontrado'
+          });
         }
       } catch (error) {
         console.error('Erro ao carregar dados de ambiente:', error);
       }
     };
     
+    // Carregar imediatamente
     loadEnvironmentData();
-    const interval = setInterval(loadEnvironmentData, 30000); // A cada 30 segundos
+    
+    // Atualizar a cada 30 segundos
+    const interval = setInterval(loadEnvironmentData, 30000);
     return () => clearInterval(interval);
   }, [coach]);
   
@@ -507,51 +574,304 @@ export default function Dashboard() {
     if (!coach) return;
     
     const calculateEnvironmentStatus = () => {
-      // Filtrar alunos ativos (excluir cardio, personal, autônomos)
-      const alunosAtivos = queue.filter(m => 
-        m.status !== 'DOING_CARDIO' &&
-        m.status !== 'FINISHED' &&
-        m.priority !== 'BLUE' &&
-        m.priority !== 'BLACK' &&
-        !m.isPersonal &&
-        !m.tags.includes('PERSONAL') &&
-        !m.tags.includes('CONSULTORIA')
-      ).length;
+      // Filtrar alunos ativos para o cálculo do RATIO
+      // INCLUIR: RED, ORANGE, YELLOW, GREEN, BLUE (todos os alunos regulares)
+      // EXCLUIR: PURPLE (enviados p/ Personal), BLACK (Consultoria), cardio, finalizados
+      const alunosAtivos = queue.filter(m => {
+        if (m.status === 'DOING_CARDIO' || m.status === 'FINISHED') return false;
+        // BLUE conta no ratio! Apenas PURPLE e BLACK são excluídos
+        if (m.priority === 'BLACK' || m.priority === 'PURPLE') return false;
+        if (m.isPersonal) return false;
+        // Verificação segura de tags
+        const tags = m.tags || [];
+        if (tags.includes('PERSONAL') || tags.includes('CONSULTORIA')) return false;
+        return true;
+      }).length;
       
       // Contar professores no salão
-      // coachesOnFloor já contém apenas quem está no salão:
+      // coachesOnFloor contém quem está is_on_floor = true
       // - PROFESSOR: entra automaticamente ao fazer login
       // - SUPERVISOR: só entra quando clica no botão "Reforço"
-      const professoresOnline = coachesOnFloor.length || 1; // Mínimo 1 para evitar divisão por zero
+      // - ADMIN: só entra quando clica no botão "Reforço"
+      // TODOS que estão no salão (is_on_floor=true) contam para o ratio
+      let professoresOnline = coachesOnFloor.filter(c => {
+        const role = (c.role || '').toUpperCase();
+        // Qualquer role que está no salão conta (PROFESSOR, SUPERVISOR, ADMIN)
+        return role === 'PROFESSOR' || role === 'SUPERVISOR' || role === 'ADMIN';
+      }).length;
+      
+      // Se este coach está no salão mas não aparece na lista, contar
+      const coachRole = (coach.role || '').toUpperCase();
+      if (isCoachOnFloor && professoresOnline === 0) {
+        professoresOnline = 1;
+        console.log('[EnvStatus] Coach no salão mas coachesOnFloor vazio - usando 1');
+      }
+      
+      // NÃO forçar mínimo 1 - se não tem professor, ratio deve ir para CRÍTICO
+      // Usar 0.1 apenas para evitar divisão por zero no cálculo
+      const divisor = professoresOnline === 0 ? 0.1 : professoresOnline;
       
       // Calcular ratio
-      const ratio = alunosAtivos / professoresOnline;
+      const ratio = alunosAtivos / divisor;
+      
+      // Se não há professores, forçar nível CRÍTICO
+      const semProfessores = professoresOnline === 0;
+      
+      // LOG DETALHADO PARA DEBUG
+      console.log('[EnvStatus] Cálculo:', {
+        totalQueue: queue.length,
+        alunosAtivos,
+        coachesOnFloorLength: coachesOnFloor.length,
+        coachesOnFloor: coachesOnFloor.map(c => c.coachName),
+        isCoachOnFloor,
+        professoresOnline,
+        ratio: ratio.toFixed(2),
+        envConfigRatios: {
+          ratioOtimo: envConfig.ratioOtimo,
+          ratioBom: envConfig.ratioBom,
+          ratioBaixo: envConfig.ratioBaixo
+        }
+      });
       
       // Calcular nível de capacidade
       const nivelCapacidade = calcularNivelCapacidade(ratio, envConfig);
       
-      // Contar cards por tempo de espera
-      const now = Date.now();
-      let cardsOtimo = 0, cardsBom = 0, cardsBaixo = 0, cardsCritico = 0;
-      
-      queue.forEach(m => {
-        if (m.status === 'DOING_CARDIO' || m.status === 'FINISHED') return;
-        if (m.priority === 'BLUE' || m.priority === 'BLACK') return;
-        if (m.isPersonal || m.tags.includes('PERSONAL') || m.tags.includes('CONSULTORIA')) return;
-        
-        const waitTime = (now - new Date(m.checkInTime).getTime()) / 1000;
-        
-        if (waitTime > envConfig.tempoFilaCritico) cardsCritico++;
-        else if (waitTime > envConfig.tempoFilaBaixo) cardsBaixo++;
-        else if (waitTime > envConfig.tempoFilaBom) cardsBom++;
-        else if (waitTime > envConfig.tempoFilaOtimo) cardsOtimo++;
+      // LOG adicional para verificar cálculo do nível
+      console.log('[EnvStatus] Nível Capacidade:', {
+        ratio,
+        ratioOtimo: envConfig.ratioOtimo,
+        ratioBom: envConfig.ratioBom,
+        ratioBaixo: envConfig.ratioBaixo,
+        nivelCalculado: nivelCapacidade,
+        verificacao: ratio <= envConfig.ratioOtimo ? 'OTIMO' : ratio <= envConfig.ratioBom ? 'BOM' : ratio <= envConfig.ratioBaixo ? 'BAIXO' : 'CRITICO'
       });
       
-      // Calcular nível de fila
-      const nivelFila = calcularNivelFila(cardsOtimo, cardsBom, cardsBaixo, cardsCritico, envConfig);
+      // Contar cards por TEMPO DE ATRASO (não tempo desde check-in!)
+      // ATRASO = tempo esperando - alertInterval da prioridade
+      // Se atraso > 0, o card está atrasado e conta para o nível de fila
+      const now = Date.now();
+      
+      // Contadores por COR e tempo de atraso
+      const cardsPorCor: Record<string, { total: number; comAtraso: Record<number, number> }> = {
+        RED: { total: 0, comAtraso: {} },
+        ORANGE: { total: 0, comAtraso: {} },
+        YELLOW: { total: 0, comAtraso: {} },
+        GREEN: { total: 0, comAtraso: {} },
+        BLUE: { total: 0, comAtraso: {} },
+      };
+      
+      // Log para debug
+      const cardDetails: any[] = [];
+      const excludedCards: any[] = [];
+      
+      queue.forEach(m => {
+        // Excluir cards que não precisam de atenção do coach
+        if (m.status === 'DOING_CARDIO' || m.status === 'FINISHED') {
+          excludedCards.push({ name: m.name.split(' ')[0], reason: 'status: ' + m.status });
+          return;
+        }
+        
+        // BLUE conta no atraso! Apenas PURPLE e BLACK são excluídos
+        if (m.priority === 'BLACK' || m.priority === 'PURPLE') {
+          excludedCards.push({ name: m.name.split(' ')[0], reason: 'priority: ' + m.priority });
+          return;
+        }
+        
+        // Excluir cards marcados como Personal (verificação segura)
+        const tags = m.tags || [];
+        const hasPersonalTag = tags.includes('PERSONAL') || tags.includes('CONSULTORIA');
+        if (m.isPersonal || hasPersonalTag) {
+          excludedCards.push({ name: m.name.split(' ')[0], reason: 'isPersonal: ' + m.isPersonal + ', tags: ' + tags.join(',') });
+          return;
+        }
+        
+        // Tempo esperando em MINUTOS (desde último atendimento ou check-in)
+        const lastAttendedTime = m.lastAttendedAt ? new Date(m.lastAttendedAt).getTime() : new Date(m.checkInTime).getTime();
+        const waitingMinutes = (now - lastAttendedTime) / 60000;
+        
+        // Intervalo de atendimento da prioridade (em minutos)
+        const alertInterval = PRIORITY_CONFIG[m.priority]?.alertInterval || 5;
+        
+        // TEMPO DE ATRASO em SEGUNDOS (negativo se ainda tem tempo, positivo se atrasado)
+        const delaySeconds = (waitingMinutes - alertInterval) * 60;
+        
+        // Contar card por cor
+        const cor = m.priority as string;
+        if (cardsPorCor[cor]) {
+          cardsPorCor[cor].total++;
+          
+          // Se está atrasado (delaySeconds > 0), registrar o atraso
+          if (delaySeconds > 0) {
+            // Registrar em múltiplos thresholds (para verificar depois)
+            [30, 60, 90, 120, 180, 240, 300, 360].forEach(threshold => {
+              if (delaySeconds >= threshold) {
+                cardsPorCor[cor].comAtraso[threshold] = (cardsPorCor[cor].comAtraso[threshold] || 0) + 1;
+              }
+            });
+            
+            cardDetails.push({
+              name: m.name.split(' ')[0],
+              priority: m.priority,
+              alertInterval,
+              waitingMin: waitingMinutes.toFixed(1),
+              delaySec: Math.floor(delaySeconds),
+            });
+          }
+        }
+      });
+      
+      // Log de cards atrasados e excluídos
+      console.log('[EnvStatus] Cards EXCLUÍDOS do cálculo:', excludedCards);
+      if (cardDetails.length > 0) {
+        console.log('[EnvStatus] Cards ATRASADOS:', cardDetails);
+      } else {
+        console.log('[EnvStatus] Nenhum card atrasado');
+      }
+      console.log('[EnvStatus] Cards por cor:', cardsPorCor);
+      
+      // =========================================================================
+      // CALCULAR NÍVEL DE FILA COM CONFIGURAÇÃO AVANÇADA POR COR
+      // =========================================================================
+      let nivelFila: NivelAtendimento = 'OTIMO';
+      
+      // Tentar carregar configuração avançada do envConfig
+      let configFilaAvancada: any[] = [];
+      try {
+        if ((envConfig as any).configFilaAvancada) {
+          configFilaAvancada = JSON.parse((envConfig as any).configFilaAvancada);
+        }
+      } catch (e) {
+        console.log('[EnvStatus] Usando configuração de fila padrão');
+      }
+      
+      // Calcular total de cards com atraso para condição geral
+      const totalCardsComAtraso: Record<number, number> = {};
+      cardDetails.forEach(card => {
+        [30, 60, 90, 120, 180, 240, 300, 360].forEach(threshold => {
+          if (card.delaySec >= threshold) {
+            totalCardsComAtraso[threshold] = (totalCardsComAtraso[threshold] || 0) + 1;
+          }
+        });
+      });
+      
+      // Se temos configuração avançada, usar ela
+      if (configFilaAvancada.length > 0) {
+        // Verificar na ordem: CRITICO → BAIXO → BOM
+        const ordemVerificacao = ['CRITICO', 'BAIXO', 'BOM'];
+        
+        for (const nivelCheck of ordemVerificacao) {
+          const configNivel = configFilaAvancada.find((n: any) => n.nivel === nivelCheck);
+          if (!configNivel) continue;
+          
+          let nivelAtivado = false;
+          
+          // =========================================================================
+          // 1. VERIFICAR CONDIÇÃO GERAL (qualquer cor)
+          // =========================================================================
+          if (configNivel.condicaoGeral && configNivel.condicaoGeral.ativa) {
+            const { quantidade, tempoAtraso } = configNivel.condicaoGeral;
+            
+            // Contar total de cards com atraso >= tempoAtraso (qualquer cor)
+            let totalComAtraso = totalCardsComAtraso[tempoAtraso] || 0;
+            
+            // Se não temos o threshold exato, contar manualmente
+            if (totalComAtraso === 0) {
+              totalComAtraso = cardDetails.filter(c => c.delaySec >= tempoAtraso).length;
+            }
+            
+            console.log(`[EnvStatus] Verificando GERAL ${nivelCheck}: ${quantidade}+ cards (qualquer) com atraso >= ${tempoAtraso}s | Encontrados: ${totalComAtraso}`);
+            
+            if (totalComAtraso >= quantidade) {
+              nivelFila = nivelCheck as NivelAtendimento;
+              console.log(`[EnvStatus] ✅ CONDIÇÃO GERAL satisfeita! Nível de fila: ${nivelFila}`);
+              nivelAtivado = true;
+            }
+          }
+          
+          // =========================================================================
+          // 2. VERIFICAR CONDIÇÕES ESPECÍFICAS POR COR (se geral não ativou)
+          // =========================================================================
+          if (!nivelAtivado && configNivel.condicoes && configNivel.condicoes.length > 0) {
+            for (const condicao of configNivel.condicoes) {
+              const { cor, quantidade, tempoAtraso } = condicao;
+              
+              // Contar quantos cards desta cor têm atraso >= tempoAtraso
+              let cardsContados = 0;
+              
+              // Verificar contando manualmente pelos thresholds
+              Object.entries(cardsPorCor[cor]?.comAtraso || {}).forEach(([threshold, count]) => {
+                if (parseInt(threshold) >= tempoAtraso) {
+                  cardsContados = Math.max(cardsContados, count as number);
+                }
+              });
+              
+              // Se não encontrou, verificar diretamente
+              if (cardsContados === 0 && cardsPorCor[cor]?.comAtraso[tempoAtraso]) {
+                cardsContados = cardsPorCor[cor].comAtraso[tempoAtraso];
+              }
+              
+              console.log(`[EnvStatus] Verificando ${nivelCheck}: ${quantidade}+ cards ${cor} com atraso >= ${tempoAtraso}s | Encontrados: ${cardsContados}`);
+              
+              if (cardsContados >= quantidade) {
+                nivelFila = nivelCheck as NivelAtendimento;
+                console.log(`[EnvStatus] ✅ Condição ESPECÍFICA satisfeita! Nível de fila: ${nivelFila}`);
+                nivelAtivado = true;
+                break;
+              }
+            }
+          }
+          
+          // Se já encontrou um nível, parar (não precisa verificar os mais leves)
+          if (nivelAtivado) break;
+        }
+      }
+      
+      // Calcular cards por nível de atraso (para compatibilidade e logs)
+      let cardsOtimo = 0, cardsBom = 0, cardsBaixo = 0, cardsCritico = 0;
+      cardDetails.forEach(card => {
+        const delaySec = card.delaySec;
+        if (delaySec > envConfig.tempoFilaCritico) {
+          cardsCritico++;
+        } else if (delaySec > envConfig.tempoFilaBaixo) {
+          cardsBaixo++;
+        } else if (delaySec > envConfig.tempoFilaBom) {
+          cardsBom++;
+        } else {
+          cardsOtimo++;
+        }
+      });
+      
+      // Se não usou configuração avançada, calcular nível com sistema antigo
+      if (configFilaAvancada.length === 0) {
+        nivelFila = calcularNivelFila(cardsOtimo, cardsBom, cardsBaixo, cardsCritico, envConfig);
+      }
       
       // Pior nível entre os dois
-      const nivel = getPiorNivel(nivelCapacidade, nivelFila);
+      // Se não há professores, SEMPRE é CRÍTICO
+      let nivel = getPiorNivel(nivelCapacidade, nivelFila);
+      if (semProfessores) {
+        nivel = 'CRITICO';
+      }
+      
+      // LOG DETALHADO DO NÍVEL
+      console.log('[EnvStatus] Níveis:', {
+        semProfessores,
+        professoresOnline,
+        nivelCapacidade,
+        nivelFila,
+        nivelFinal: nivel,
+        cards: { otimo: cardsOtimo, bom: cardsBom, baixo: cardsBaixo, critico: cardsCritico },
+        cardsPorCor: Object.fromEntries(
+          Object.entries(cardsPorCor).map(([cor, data]) => [cor, { total: data.total, atrasados: Object.keys(data.comAtraso).length > 0 ? data.comAtraso : 'nenhum' }])
+        ),
+        usandoConfigAvancada: configFilaAvancada.length > 0,
+        tempos: {
+          otimo: envConfig.tempoFilaOtimo,
+          bom: envConfig.tempoFilaBom,
+          baixo: envConfig.tempoFilaBaixo,
+          critico: envConfig.tempoFilaCritico
+        }
+      });
       
       // Calcular tempos ajustados
       const temposAjustados = calcularTemposAjustados(nivel, envConfig);
@@ -597,7 +917,6 @@ export default function Dashboard() {
               tempoLaranja: temposAjustados.laranja,
               tempoAmarelo: temposAjustados.amarelo,
               tempoVerde: temposAjustados.verde,
-              tempoAzul: temposAjustados.azul,
               alertaTipo: nivel === 'CRITICO' ? 'BOTH' : 'FULLSCREEN'
             })
           }).catch(console.error);
@@ -643,7 +962,7 @@ export default function Dashboard() {
         tempoLaranja: temposAjustados.laranja,
         tempoAmarelo: temposAjustados.amarelo,
         tempoVerde: temposAjustados.verde,
-        tempoAzul: temposAjustados.azul,
+        tempoAzul: temposAjustados.azul || 450,
         ultimoAlerta: lastEnvAlertRef.current,
         proximoAlerta,
       });
@@ -658,6 +977,19 @@ export default function Dashboard() {
   const toggleCoachOnFloor = async () => {
     if (!coach) return;
     
+    // Determinar role correto (ADMIN, SUPERVISOR ou PROFESSOR)
+    const coachRole = coach.role || (coach.is_supervisor ? 'SUPERVISOR' : 'PROFESSOR');
+    const newFloorStatus = !isCoachOnFloor;
+    
+    console.log(`[Reforço] Tentando ${newFloorStatus ? 'entrar' : 'sair'} do salão...`, {
+      coachId: coach.id,
+      coachName: coach.name,
+      role: coachRole,
+      currentStatus: isCoachOnFloor,
+      newStatus: newFloorStatus,
+      currentCoachesOnFloor: coachesOnFloor.length
+    });
+    
     try {
       const response = await fetch('/api/environment', {
         method: 'PUT',
@@ -665,23 +997,75 @@ export default function Dashboard() {
         body: JSON.stringify({
           coachId: coach.id,
           coachName: coach.name,
-          role: coach.is_supervisor ? 'SUPERVISOR' : 'PROFESSOR',
-          isOnFloor: !isCoachOnFloor
+          role: coachRole,
+          isOnFloor: newFloorStatus
         })
       });
       
       if (response.ok) {
-        setIsCoachOnFloor(!isCoachOnFloor);
+        const data = await response.json();
+        console.log('[Reforço] Resposta da API:', {
+          success: data.success,
+          isOnFloor: data.isOnFloor,
+          coachesCount: data.coachesCount,
+          coaches: data.coaches
+        });
         
-        // Atualizar lista de coaches
-        const envResponse = await fetch('/api/environment');
-        if (envResponse.ok) {
-          const data = await envResponse.json();
-          setCoachesOnFloor(data.coaches || []);
+        // Atualizar estado local imediatamente
+        setIsCoachOnFloor(newFloorStatus);
+        
+        // CORREÇÃO PRINCIPAL: Usar os coaches retornados pela API diretamente
+        // Isso garante que o estado está sincronizado com o banco de dados
+        if (data.coaches && Array.isArray(data.coaches)) {
+          setCoachesOnFloor(data.coaches);
+          console.log(`[Reforço] Coaches atualizados da API. Total no salão: ${data.coaches.length}`);
+        } else {
+          // Fallback: atualizar localmente se a API não retornar coaches
+          if (newFloorStatus) {
+            // Entrando no salão - adicionar este coach se não estiver na lista
+            const alreadyInList = coachesOnFloor.some((c: any) => c.coachId === coach.id);
+            if (!alreadyInList) {
+              const updatedCoaches = [...coachesOnFloor, {
+                coachId: coach.id,
+                coachName: coach.name,
+                role: coachRole,
+                since: new Date().toISOString()
+              }];
+              setCoachesOnFloor(updatedCoaches);
+              console.log(`[Reforço] ${coach.name} entrou no salão (fallback). Total: ${updatedCoaches.length}`);
+            }
+          } else {
+            // Saindo do salão - remover este coach da lista
+            const updatedCoaches = coachesOnFloor.filter(
+              (c: any) => c.coachId !== coach.id
+            );
+            setCoachesOnFloor(updatedCoaches);
+            console.log(`[Reforço] ${coach.name} saiu do salão (fallback). Total: ${updatedCoaches.length}`);
+          }
         }
+        
+        // NOVO: Forçar reload completo do environment após 500ms para garantir sincronização
+        setTimeout(async () => {
+          try {
+            const envResponse = await fetch('/api/environment');
+            if (envResponse.ok) {
+              const envData = await envResponse.json();
+              if (envData.coaches) {
+                setCoachesOnFloor(envData.coaches);
+                console.log(`[Reforço] Reload completo: ${envData.coaches.length} coaches no salão`);
+              }
+            }
+          } catch (e) {
+            console.error('[Reforço] Erro no reload:', e);
+          }
+        }, 500);
+        
+      } else {
+        const errorText = await response.text();
+        console.error('[Reforço] Erro na API:', errorText);
       }
     } catch (error) {
-      console.error('Erro ao atualizar status no salão:', error);
+      console.error('[Reforço] Erro ao atualizar status no salão:', error);
     }
   };
 
@@ -995,30 +1379,71 @@ export default function Dashboard() {
   const handleLogin = async (c: Coach) => {
     setCoach(c);
     localStorage.setItem('iron_coach_session', JSON.stringify(c));
+    // Registrar timestamp do login para evitar force logout em sessões novas
+    localStorage.setItem('iron_coach_login_time', Date.now().toString());
     
-    // MULTI-PROFESSOR: Iniciar sessão do coach
-    await startCoachSession(c.id, c.name);
+    // Determinar role correto (ADMIN, SUPERVISOR ou PROFESSOR)
+    const coachRole = c.role || (c.is_supervisor ? 'SUPERVISOR' : 'PROFESSOR');
+    
+    // MULTI-PROFESSOR: Iniciar sessão do coach (com role)
+    await startCoachSession(c.id, c.name, coachRole);
     
     // Buscar coaches ativos
     const coaches = await getActiveCoaches();
     setActiveCoaches(coaches);
     
-    // ALERTAS DE AMBIENTE: Registrar professor no floor (não supervisores)
-    // Supervisores só entram no floor quando clicam no botão "Reforço"
-    if (c.role !== 'SUPERVISOR' && c.role !== 'ADMIN') {
+    // ALERTAS DE AMBIENTE: Registrar professor no floor (não supervisores/admins)
+    // Supervisores e admins só entram no floor quando clicam no botão "Reforço"
+    if (coachRole !== 'SUPERVISOR' && coachRole !== 'ADMIN') {
       try {
-        await fetch('/api/environment', {
+        const response = await fetch('/api/environment', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             coachId: c.id,
             coachName: c.name,
-            role: c.role || 'PROFESSOR',
+            role: coachRole,
             isOnFloor: true
           })
         });
+        
+        if (response.ok) {
+          const data = await response.json();
+          // CORREÇÃO: Atualizar coachesOnFloor com dados da API
+          if (data.coaches && Array.isArray(data.coaches)) {
+            setCoachesOnFloor(data.coaches);
+            console.log(`[Login] Coaches no salão atualizados: ${data.coaches.length}`);
+          }
+          setIsCoachOnFloor(true);
+        }
       } catch (err) {
         console.error('Erro ao registrar no floor:', err);
+        // Fallback: adicionar este coach localmente
+        setCoachesOnFloor([{
+          coachId: c.id,
+          coachName: c.name,
+          role: coachRole,
+          since: new Date().toISOString()
+        }]);
+        setIsCoachOnFloor(true);
+      }
+    } else {
+      // Supervisor/Admin não entra automaticamente, carregar dados atuais
+      try {
+        const envResponse = await fetch('/api/environment');
+        if (envResponse.ok) {
+          const envData = await envResponse.json();
+          if (envData.coaches) {
+            setCoachesOnFloor(envData.coaches);
+          }
+          // Verificar se este coach específico está no salão
+          const thisCoachOnFloor = envData.allCoaches?.find(
+            (coach: any) => String(coach.coach_id) === String(c.id) && coach.is_on_floor === true
+          );
+          setIsCoachOnFloor(!!thisCoachOnFloor);
+        }
+      } catch (err) {
+        console.error('Erro ao carregar environment:', err);
       }
     }
   };
@@ -1209,7 +1634,8 @@ export default function Dashboard() {
   const handleResumeSession = async () => {
     if (!coach) return;
     
-    await startCoachSession(coach.id, coach.name);
+    const coachRole = coach.role || (coach.is_supervisor ? 'SUPERVISOR' : 'PROFESSOR');
+    await startCoachSession(coach.id, coach.name, coachRole);
     
     // Atualizar lista de coaches
     const coaches = await getActiveCoaches();
@@ -1653,7 +2079,11 @@ export default function Dashboard() {
               background: NIVEL_CONFIG[envStatus.nivel].bgColor,
               border: `1px solid ${NIVEL_CONFIG[envStatus.nivel].borderColor}`,
             }}
-            title={`${NIVEL_CONFIG[envStatus.nivel].label}: ${envStatus.alunosAtivos} alunos / ${envStatus.professoresOnline} prof (${envStatus.ratio.toFixed(1)}:1)`}
+            title={`${NIVEL_CONFIG[envStatus.nivel].label}\n` +
+              `📊 Ratio: ${envStatus.ratio.toFixed(1)}:1 (${envStatus.alunosAtivos} alunos / ${envStatus.professoresOnline} prof)\n` +
+              `⏱️ Cards críticos (>5min): ${envStatus.cardsEsperandoCritico || 0}\n` +
+              `Nível por Capacidade: ${envStatus.nivelCapacidade}\n` +
+              `Nível por Fila: ${envStatus.nivelFila}`}
           >
             <span className="text-sm">{NIVEL_CONFIG[envStatus.nivel].emoji}</span>
             <div className="hidden lg:flex flex-col">
@@ -2532,7 +2962,7 @@ export default function Dashboard() {
               )}
               
               {/* Tempos Ajustados */}
-              <div className="flex justify-center gap-3 text-sm flex-wrap">
+              <div className="flex justify-center gap-3 text-sm">
                 <span className="px-2 py-1 rounded bg-red-500/20 text-red-400">
                   🔴 {Math.floor(envStatus.tempoVermelho / 60)}:{String(envStatus.tempoVermelho % 60).padStart(2, '0')}
                 </span>
@@ -2544,9 +2974,6 @@ export default function Dashboard() {
                 </span>
                 <span className="px-2 py-1 rounded bg-green-500/20 text-green-400">
                   🟢 {Math.floor(envStatus.tempoVerde / 60)}:{String(envStatus.tempoVerde % 60).padStart(2, '0')}
-                </span>
-                <span className="px-2 py-1 rounded bg-blue-500/20 text-blue-400">
-                  🔵 {Math.floor(envStatus.tempoAzul / 60)}:{String(envStatus.tempoAzul % 60).padStart(2, '0')}
                 </span>
               </div>
               

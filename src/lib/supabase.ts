@@ -23,7 +23,7 @@ export const isSupabaseConfigured = Boolean(supabaseUrl && supabaseAnonKey);
 // TYPES
 // ============================================================================
 
-export type Priority = 'RED' | 'ORANGE' | 'YELLOW' | 'GREEN' | 'BLUE' | 'PURPLE' | 'BLACK';
+export type Priority = 'RED' | 'ORANGE' | 'YELLOW' | 'BLUE' | 'GREEN' | 'PURPLE' | 'BLACK';
 export type QueueStatus = 'WAITING' | 'TRAINING' | 'BEING_ATTENDED' | 'IDLE' | 'DOING_CARDIO' | 'FINISHED';
 
 export interface Coach {
@@ -95,7 +95,7 @@ export async function getQueue(): Promise<QueueMember[]> {
     return [];
   }
 
-  const priorityOrder = { RED: 0, ORANGE: 1, YELLOW: 2, GREEN: 3, BLUE: 4, PURPLE: 5, BLACK: 6 };
+  const priorityOrder = { RED: 0, ORANGE: 1, YELLOW: 2, BLUE: 3, GREEN: 4, PURPLE: 5, BLACK: 6 };
   
   return (data || [])
     .map(item => ({
@@ -104,7 +104,7 @@ export async function getQueue(): Promise<QueueMember[]> {
     }))
     .sort((a, b) => {
       if (a.help_requested !== b.help_requested) return a.help_requested ? -1 : 1;
-      return priorityOrder[a.priority as Priority] - priorityOrder[b.priority as Priority];
+      return (priorityOrder[a.priority as Priority] || 99) - (priorityOrder[b.priority as Priority] || 99);
     });
 }
 
@@ -447,8 +447,8 @@ const PRIORITY_BONUS: Record<Priority, number> = {
   RED: 5,
   ORANGE: 3,
   YELLOW: 2,
-  GREEN: 1,
   BLUE: 1,
+  GREEN: 0,
   PURPLE: 0,
   BLACK: 0,
 };
@@ -774,12 +774,16 @@ export async function updateMemberPriority(
   const currentTags = currentData?.tags || [];
   let newTags = [...currentTags];
   
-  // Adicionar tag apropriada
-  if (isPersonal && !newTags.includes('PERSONAL')) {
+  // Só adiciona tag se for personal/consultoria (PURPLE ou BLACK)
+  if (newPriority === 'PURPLE' && !newTags.includes('PERSONAL')) {
     newTags.push('PERSONAL');
-  } else if (!isPersonal && !newTags.includes('CONSULTORIA')) {
+  } else if (newPriority === 'BLACK' && !newTags.includes('CONSULTORIA')) {
     newTags.push('CONSULTORIA');
   }
+
+  // Determinar se deve marcar como is_personal
+  // Apenas PURPLE (Personal) e BLACK (Consultoria) são marcados
+  const shouldBePersonal = newPriority === 'PURPLE' || newPriority === 'BLACK';
 
   // Atualizar prioridade e tags
   const { error } = await supabase
@@ -787,7 +791,7 @@ export async function updateMemberPriority(
     .update({ 
       priority: newPriority,
       tags: newTags,
-      is_personal: true // Marca como personal/consultoria para ir na área separada
+      is_personal: shouldBePersonal
     })
     .eq('id', queueId);
 
@@ -798,6 +802,7 @@ export async function updateMemberPriority(
 
   return true;
 }
+
 // ============================================================================
 // COACH SESSION
 // ============================================================================
@@ -978,7 +983,7 @@ export async function markAsPersonal(
   queueId: string,
   isPersonalTrainer: boolean = true
 ): Promise<boolean> {
-  console.log('🏴 Marcando como personal/consultoria:', queueId);
+  console.log('🏴 Marcando como personal/consultoria:', queueId, 'isPersonalTrainer:', isPersonalTrainer);
   
   try {
     // Buscar tags atuais
@@ -997,11 +1002,15 @@ export async function markAsPersonal(
     const newTag = isPersonalTrainer ? 'PERSONAL' : 'CONSULTORIA';
     const newTags = currentTags.includes(newTag) ? currentTags : [...currentTags, newTag];
 
-    // Atualizar para BLACK e marcar como personal
+    // CORREÇÃO: 
+    // - PURPLE para Personal Trainer (aluno enviado para personal)
+    // - BLACK para Consultoria Externa (personal do EVO ou externo)
+    const newPriority = isPersonalTrainer ? 'PURPLE' : 'BLACK';
+
     const { error: updateError } = await supabase
       .from('queue')
       .update({
-        priority: 'BLACK',
+        priority: newPriority,
         is_personal: true,
         tags: newTags,
       })
@@ -1012,7 +1021,7 @@ export async function markAsPersonal(
       return false;
     }
 
-    console.log('✅ Marcado como personal/consultoria');
+    console.log(`✅ Marcado como ${isPersonalTrainer ? 'PURPLE (Personal)' : 'BLACK (Consultoria)'}`);
     return true;
   } catch (e) {
     console.error('Exceção ao marcar como personal:', e);
@@ -1052,7 +1061,8 @@ export async function unmarkAsPersonal(queueId: string): Promise<boolean> {
     if (daysAsMember <= 7) newPriority = 'RED';
     else if (daysAsMember <= 14) newPriority = 'ORANGE';
     else if (daysAsMember <= 30) newPriority = 'YELLOW';
-    else newPriority = 'GREEN';
+    else if (daysAsMember <= 179) newPriority = 'GREEN';
+    else newPriority = 'BLUE';
 
     const { error: updateError } = await supabase
       .from('queue')
@@ -1080,7 +1090,7 @@ export async function unmarkAsPersonal(queueId: string): Promise<boolean> {
 // MULTI-PROFESSOR - Funções para gerenciar múltiplos coaches no salão
 // ============================================================================
 
-export interface CoachSession {
+export interface CoachSessionData {
   sessionId: string;
   coachId: string;
   coachName: string;
@@ -1103,12 +1113,16 @@ export interface SuggestedMember {
  */
 export async function startCoachSession(
   coachId: string,
-  coachName: string
+  coachName: string,
+  role?: string,
+  gymId?: string
 ): Promise<{ success: boolean; sessionId?: string }> {
   try {
     const { data, error } = await supabase.rpc('start_coach_session', {
       p_coach_id: coachId,
       p_coach_name: coachName,
+      p_role: role || 'PROFESSOR',
+      p_gym_id: gymId || 'impacto'
     });
 
     if (error) {
@@ -1250,7 +1264,7 @@ export async function coachEndAttending(
 /**
  * Obtém lista de coaches ativos no salão
  */
-export async function getActiveCoaches(): Promise<CoachSession[]> {
+export async function getActiveCoaches(): Promise<CoachSessionData[]> {
   try {
     const { data, error } = await supabase.rpc('get_active_coaches');
 
@@ -1259,7 +1273,7 @@ export async function getActiveCoaches(): Promise<CoachSession[]> {
       return [];
     }
 
-    return (data?.coaches || []) as CoachSession[];
+    return (data?.coaches || []) as CoachSessionData[];
   } catch (e) {
     console.error('Exceção ao obter coaches ativos:', e);
     return [];
@@ -1303,7 +1317,7 @@ export async function notifyLongAttendance(
  * Subscreve para atualizações de sessões de coaches
  */
 export function subscribeToCoachSessions(
-  callback: (sessions: CoachSession[]) => void
+  callback: (sessions: CoachSessionData[]) => void
 ): () => void {
   const channel = supabase
     .channel('coach_sessions_changes')

@@ -753,7 +753,7 @@ export function getPhaseLabel(daysAsMemberOrPriority: number | Priority): string
   if (daysAsMember <= 21) return 'Semana 3';
   if (daysAsMember <= 30) return 'Mês 1';
   if (daysAsMember <= 60) return 'Mês 2';
-  if (daysAsMember <= 90) return 'Mês 3';
+  if (daysAsMember <= 90) return 'Mês 4';
   if (daysAsMember <= 180) return 'Veterano';
   return 'Sênior';
 }

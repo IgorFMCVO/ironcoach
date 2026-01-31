@@ -14,6 +14,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import Link from 'next/link';
 import { supabase, getCoachSession } from '@/lib/supabase';
 import AdminEnvironmentConfig from './components/AdminEnvironmentConfig';
+import AdminOnlineUsers from './components/AdminOnlineUsers';
 
 // ============================================================================
 // TYPES
@@ -71,7 +72,7 @@ export default function AdminPage() {
   const [showAddModal, setShowAddModal] = useState(false);
   const [editingCoach, setEditingCoach] = useState<Coach | null>(null);
   const [showPins, setShowPins] = useState(false);
-  const [activeTab, setActiveTab] = useState<'users' | 'config' | 'ambiente'>('users');
+  const [activeTab, setActiveTab] = useState<'users' | 'config' | 'ambiente' | 'online'>('users');
   
   // Configurações
   const [config, setConfig] = useState<SystemConfig | null>(null);
@@ -393,6 +394,16 @@ export default function AdminPage() {
             }`}
           >
             🚦 Ambiente
+          </button>
+          <button
+            onClick={() => setActiveTab('online')}
+            className={`px-6 py-4 font-medium text-sm transition-all border-b-2 ${
+              activeTab === 'online'
+                ? 'border-emerald-400 text-emerald-400'
+                : 'border-transparent text-white/40 hover:text-white/60'
+            }`}
+          >
+            🟢 Online
           </button>
         </div>
       </div>
@@ -828,6 +839,17 @@ export default function AdminPage() {
               exit={{ opacity: 0, y: -20 }}
             >
               <AdminEnvironmentConfig />
+            </motion.div>
+          )}
+
+          {activeTab === 'online' && admin && (
+            <motion.div
+              key="online"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+            >
+              <AdminOnlineUsers adminId={admin.id} adminName={admin.name} />
             </motion.div>
           )}
         </AnimatePresence>
