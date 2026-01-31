@@ -50,6 +50,14 @@ export interface EnvironmentConfig {
   
   // WhatsApp do supervisor
   supervisorWhatsapp?: string;
+  
+  // Anti-burla
+  tempoMinimoAtendimento: number;
+  alertasBurlaSequencia: number;
+  alertasBurlaJanelaMinutos: number;
+  
+  // Configuração avançada de fila (JSON stringified)
+  configFilaAvancada?: string;
 }
 
 export interface EnvironmentStatus {
@@ -109,6 +117,11 @@ export const DEFAULT_ENVIRONMENT_CONFIG: EnvironmentConfig = {
   alertaDuracaoBom: 2,
   alertaDuracaoBaixo: 3,
   alertaDuracaoCritico: 4,
+  
+  // Anti-burla
+  tempoMinimoAtendimento: 10,
+  alertasBurlaSequencia: 3,
+  alertasBurlaJanelaMinutos: 5,
 };
 
 export const NIVEL_CONFIG: Record<NivelAtendimento, {

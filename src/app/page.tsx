@@ -23,6 +23,7 @@ import Link from 'next/link';
 import Login from './components/Login';
 import ManualEntryModal from './components/ManualEntryModal';
 import ActivityTimeline from './components/ActivityTimeline';
+import FinishAttendanceModal, { FraudAlertBanner } from './components/FinishAttendanceModal';
 import { 
   AdminIcon, 
   SupervisorIcon, 
@@ -435,6 +436,20 @@ export default function Dashboard() {
   const [isCoachOnFloor, setIsCoachOnFloor] = useState(false);
   const lastEnvAlertRef = useRef<Date | null>(null);
   const envAlertSoundPlayedRef = useRef(false);
+  
+  // Anti-burla: Modal de confirmação e alertas de fraude
+  const [showFinishModal, setShowFinishModal] = useState(false);
+  const [pendingFinishData, setPendingFinishData] = useState<{
+    elapsed: number;
+    memberName: string;
+  } | null>(null);
+  const [fraudAlerts, setFraudAlerts] = useState<Array<{
+    id: string;
+    coach_name: string;
+    suspicious_count: number;
+    time_window_minutes: number;
+    created_at: string;
+  }>>([]);
   
   const { playSound, playAlert } = useAudio();
   const { vibrateSuccess } = useVibration();
@@ -1536,32 +1551,71 @@ export default function Dashboard() {
     setContinuedStartTime(Date.now()); // Marca quando começou o tempo extra
   };
 
-  const finishAttendance = async () => {
+  const finishAttendance = async (confirmedSuspicious: boolean = false, interventionType?: string, note?: string) => {
     if (!activeAttendance || !coach) return;
     
     const elapsed = Math.floor((Date.now() - activeAttendance.startTime) / 1000);
     const maxTime = PRIORITY_CONFIG[activeAttendance.member.priority]?.attendanceTime || 15;
     
+    // Usar configuração anti-burla do ambiente
+    const minTime = envConfig.tempoMinimoAtendimento || 10;
+    
+    // Se atendimento muito curto E não confirmou ainda, mostrar modal
+    if (elapsed < minTime && !confirmedSuspicious) {
+      setPendingFinishData({
+        elapsed,
+        memberName: activeAttendance.member.name
+      });
+      setShowFinishModal(true);
+      return; // Aguardar confirmação do modal
+    }
+    
     // Determinar alertas
     let alertType: string | null = null;
-    if (elapsed < 5) {
-      alertType = 'TOO_SHORT'; // Menos de 5 segundos
+    const isSuspicious = elapsed < minTime && confirmedSuspicious;
+    if (isSuspicious) {
+      alertType = 'TOO_SHORT'; // Confirmado como suspeito
     } else if (elapsed > maxTime * 3) {
       alertType = 'EXCEEDED'; // Mais de 3x o tempo base
     }
     
+    // Registrar no sistema anti-burla via API
+    if (isSuspicious) {
+      try {
+        const res = await fetch('/api/attendance', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'finish',
+            attendanceId: activeAttendance.member.id,
+            interventionType: interventionType || 'CHECK',
+            interventionNote: note,
+            confirmedSuspicious: true
+          })
+        });
+        const data = await res.json();
+        
+        // Se gerou alerta de sequência, recarregar alertas
+        if (data.sequenceAlert) {
+          loadFraudAlerts();
+        }
+      } catch (error) {
+        console.error('Erro ao registrar atendimento suspeito:', error);
+      }
+    }
+    
     const xpResult = await recordIntervention({
       coachId: coach.id,
-      coachName: coach.name,  // Adicionado para salvar nome nos relatórios
+      coachName: coach.name,
       queueId: activeAttendance.member.id,
       memberName: activeAttendance.member.name,
       memberPriority: activeAttendance.member.priority,
-      interventionType: 'CHECK' as DBInterventionType,
+      interventionType: (interventionType || 'CHECK') as DBInterventionType,
       durationSeconds: elapsed,
       streak: 1,
       multiplier: 1,
       alertType,
-      isContinued, // Registra se usou modo continuado
+      isContinued,
     });
     
     await endAttendance(activeAttendance.member.id, 'completed', coach.name);
@@ -1588,18 +1642,88 @@ export default function Dashboard() {
     // Log de fim de atendimento
     logAttendanceEnd(
       activeAttendance.member.name,
-      undefined, // memberEvoId
+      undefined,
       activeAttendance.member.id,
-      Math.floor(elapsed / 60) // converter segundos para minutos
+      Math.floor(elapsed / 60)
     );
     
     setActiveAttendance(null);
     setIsContinued(false);
     setContinuedStartTime(null);
-    setLongAttendanceNotified(false); // Reset
-    setShowTimeExceededAlert(false); // Reset
+    setLongAttendanceNotified(false);
+    setShowTimeExceededAlert(false);
+    setShowFinishModal(false);
+    setPendingFinishData(null);
     loadQueue();
   };
+
+  // Handler para confirmação do modal anti-burla
+  const handleFinishConfirmed = (interventionType: string, note?: string, confirmedSuspicious?: boolean) => {
+    setShowFinishModal(false);
+    finishAttendance(confirmedSuspicious || false, interventionType, note);
+  };
+
+  // Carregar alertas de fraude (para supervisores)
+  const loadFraudAlerts = async () => {
+    if (coach?.role !== 'SUPERVISOR' && coach?.role !== 'ADMIN') return;
+    
+    try {
+      const res = await fetch('/api/attendance?type=fraud-alerts');
+      const data = await res.json();
+      if (data.success) {
+        setFraudAlerts(data.alerts || []);
+      }
+    } catch (error) {
+      console.error('Erro ao carregar alertas de fraude:', error);
+    }
+  };
+
+  // Handlers para alertas de fraude
+  const handleDismissFraudAlert = async (alertId: string) => {
+    try {
+      await fetch('/api/attendance', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          alertId,
+          action: 'dismiss',
+          actionedBy: coach?.name
+        })
+      });
+      setFraudAlerts(prev => prev.filter(a => a.id !== alertId));
+    } catch (error) {
+      console.error('Erro ao ignorar alerta:', error);
+    }
+  };
+
+  const handleWarnCoach = async (alertId: string) => {
+    try {
+      await fetch('/api/attendance', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          alertId,
+          action: 'warn',
+          actionedBy: coach?.name,
+          actionNote: 'Advertência registrada via sistema'
+        })
+      });
+      setFraudAlerts(prev => prev.filter(a => a.id !== alertId));
+      alert('Advertência registrada com sucesso!');
+    } catch (error) {
+      console.error('Erro ao advertir:', error);
+    }
+  };
+
+  // Carregar alertas de fraude quando coach supervisor logar
+  useEffect(() => {
+    if (coach && (coach.role === 'SUPERVISOR' || coach.role === 'ADMIN')) {
+      loadFraudAlerts();
+      // Recarregar a cada 30 segundos
+      const interval = setInterval(loadFraudAlerts, 30000);
+      return () => clearInterval(interval);
+    }
+  }, [coach]);
 
   const cancelAttendance = async () => {
     // MULTI-PROFESSOR: Liberar aluno se estava reservado
@@ -2877,6 +3001,28 @@ export default function Dashboard() {
           if (!isMuted) playSound('success');
         }}
       />
+
+      {/* Modal Anti-Burla: Confirmação de Atendimento Curto */}
+      <FinishAttendanceModal
+        isOpen={showFinishModal}
+        onClose={() => {
+          setShowFinishModal(false);
+          setPendingFinishData(null);
+        }}
+        onConfirm={handleFinishConfirmed}
+        memberName={pendingFinishData?.memberName || activeAttendance?.member.name || ''}
+        durationSeconds={pendingFinishData?.elapsed || 0}
+        minTime={envConfig.tempoMinimoAtendimento || 10}
+      />
+
+      {/* Alertas de Fraude para Supervisores */}
+      {(coach?.role === 'SUPERVISOR' || coach?.role === 'ADMIN') && (
+        <FraudAlertBanner
+          alerts={fraudAlerts}
+          onDismiss={handleDismissFraudAlert}
+          onWarn={handleWarnCoach}
+        />
+      )}
       
       {/* ALERTA FULLSCREEN DE AMBIENTE */}
       <AnimatePresence>
